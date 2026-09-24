@@ -9,6 +9,7 @@ import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
 import android.net.Uri
+import android.os.SystemClock
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -18,12 +19,14 @@ import androidx.camera.camera2.interop.CaptureRequestOptions
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.FocusMeteringAction
+import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
 import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.animation.AnimatedVisibility
@@ -38,6 +41,7 @@ import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -56,6 +60,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -91,9 +96,11 @@ import com.devfahim00.netcam.R
 import com.devfahim00.netcam.camera.AspectRatioOption
 import com.devfahim00.netcam.camera.CameraMode
 import com.devfahim00.netcam.camera.FlashMode
+import com.devfahim00.netcam.camera.FocusResult
 import com.devfahim00.netcam.camera.FocusTarget
 import com.devfahim00.netcam.camera.PortraitStage
 import com.devfahim00.netcam.processing.HdrFusion
+import com.devfahim00.netcam.processing.NightDenoise
 import com.devfahim00.netcam.processing.PhotoEnhancer
 import com.devfahim00.netcam.processing.PortraitProcessor
 import com.devfahim00.netcam.processing.PortraitResult
@@ -103,6 +110,7 @@ import com.devfahim00.netcam.settings.AppSettings
 import com.devfahim00.netcam.settings.SettingsStore
 import com.devfahim00.netcam.ui.components.AspectChip
 import com.devfahim00.netcam.ui.components.BokehSlider
+import com.devfahim00.netcam.ui.components.EvSlider
 import com.devfahim00.netcam.ui.components.FlashPill
 import com.devfahim00.netcam.ui.components.FocusIndicator
 import com.devfahim00.netcam.ui.components.FocusModeChip
@@ -112,6 +120,7 @@ import com.devfahim00.netcam.ui.components.GlassSliderVertical
 import com.devfahim00.netcam.ui.components.GlassSurface
 import com.devfahim00.netcam.ui.components.HdrChip
 import com.devfahim00.netcam.ui.components.ModeSelector
+import com.devfahim00.netcam.ui.components.NightChip
 import com.devfahim00.netcam.ui.components.SettingsButton
 import com.devfahim00.netcam.ui.components.SettingsSheet
 import com.devfahim00.netcam.ui.components.ShutterButton
@@ -132,6 +141,9 @@ import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.coroutines.resume
 import kotlin.math.min
 import kotlin.math.roundToInt
@@ -177,6 +189,12 @@ fun CameraScreen() {
         SettingsStore.save(context, settings)
     }
 
+    // Bokeh strength lives in local state while dragging; it is only written
+    // to SharedPreferences when the drag ends (no I/O per frame).
+    var bokehLocal by remember(settings.bokehStrength) {
+        mutableStateOf(settings.bokehStrength)
+    }
+
     // ----- camera / ui state -----
     var mode by remember { mutableStateOf(CameraMode.PHOTO) }
     var flashMode by remember { mutableStateOf(FlashMode.OFF) }
@@ -195,6 +213,18 @@ fun CameraScreen() {
     var mfEnabled by remember { mutableStateOf(false) }
     var mfDiopters by remember { mutableStateOf(0f) }
     var minFocusDistance by remember { mutableStateOf<Float?>(null) }
+
+    // Exposure compensation (EV) — GCam style bias on top of auto exposure.
+    var evIndex by remember { mutableStateOf(0) }
+    var evRange by remember { mutableStateOf<IntRange?>(null) }
+    var evStep by remember { mutableStateOf(1f) }
+    var evTarget by remember { mutableStateOf<Offset?>(null) }
+    var evLastInteraction by remember { mutableLongStateOf(0L) }
+
+    // Ambient scene brightness from a tiny analysis stream (0..1), used to
+    // trigger the multi-frame night noise reduction path.
+    var ambientLuma by remember { mutableStateOf<Float?>(null) }
+    val lumaGate = remember { AtomicLong(0L) }
 
     val previewView = remember { PreviewView(context) }
 
@@ -221,11 +251,82 @@ fun CameraScreen() {
             .build()
     }
 
+    // Tiny low-res analysis stream that continuously meters scene brightness.
+    val analysisExecutor = remember { Executors.newSingleThreadExecutor() }
+    DisposableEffect(Unit) {
+        onDispose { analysisExecutor.shutdown() }
+    }
+    val imageAnalysis = remember {
+        ImageAnalysis.Builder()
+            .setResolutionSelector(
+                ResolutionSelector.Builder()
+                    .setResolutionStrategy(
+                        ResolutionStrategy(
+                            android.util.Size(160, 120),
+                            ResolutionStrategy.FALLBACK_RULE_CLOSEST_LOWER_THEN_HIGHER
+                        )
+                    )
+                    .build()
+            )
+            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+            .build()
+            .also { analysis ->
+                analysis.setAnalyzer(analysisExecutor, ImageAnalysis.Analyzer { image ->
+                    try {
+                        val now = SystemClock.uptimeMillis()
+                        if (now - lumaGate.get() >= 450L) {
+                            lumaGate.set(now)
+                            val plane = image.planes[0]
+                            val buffer = plane.buffer
+                            val rowStride = plane.rowStride
+                            val pixelStride = plane.pixelStride
+                            val iw = image.width
+                            val ih = image.height
+                            val stepX = maxOf(1, iw / 32)
+                            val stepY = maxOf(1, ih / 24)
+                            val cap = buffer.capacity()
+                            var sum = 0L
+                            var count = 0
+                            var row = 0
+                            while (row < ih) {
+                                val rowBase = row * rowStride
+                                var col = 0
+                                while (col < iw) {
+                                    val idx = rowBase + col * pixelStride
+                                    if (idx < cap) {
+                                        sum += buffer.get(idx).toInt() and 0xFF
+                                        count++
+                                    }
+                                    col += stepX
+                                }
+                                row += stepY
+                            }
+                            if (count > 0) {
+                                ambientLuma = sum.toFloat() / count / 255f
+                            }
+                        }
+                    } catch (t: Throwable) {
+                        // The meter must never crash the camera.
+                    } finally {
+                        image.close()
+                    }
+                })
+            }
+    }
+
     LaunchedEffect(toastRes) {
         toastRes?.let {
             Toast.makeText(context, it, Toast.LENGTH_SHORT).show()
             toastRes = null
         }
+    }
+
+    // Applies an exposure compensation index (clamped to the device range).
+    fun applyEv(index: Int) {
+        val range = evRange ?: return
+        val clamped = index.coerceIn(range.first, range.last)
+        evIndex = clamped
+        camera?.cameraControl?.setExposureCompensationIndex(clamped)
     }
 
     // ----- bind / rebind camera -----
@@ -256,7 +357,9 @@ fun CameraScreen() {
         val selector = CameraSelector.Builder().requireLensFacing(lensFacing).build()
         provider.unbindAll()
         try {
-            val cam = provider.bindToLifecycle(lifecycleOwner, selector, preview, imageCapture)
+            val cam = provider.bindToLifecycle(
+                lifecycleOwner, selector, preview, imageCapture, imageAnalysis
+            )
             camera = cam
             cam.cameraControl.enableTorch(flashMode == FlashMode.TORCH)
             val zoomState = cam.cameraInfo.zoomState.value
@@ -271,6 +374,42 @@ fun CameraScreen() {
             if (minFocusDistance == null) mfEnabled = false
             mfDiopters = 0f
 
+            // Exposure compensation range / step for the EV slider.
+            val exposureState = cam.cameraInfo.exposureState
+            evRange = if (exposureState.isExposureCompensationSupported) {
+                val range = exposureState.exposureCompensationRange
+                val rational = exposureState.exposureCompensationStep
+                evStep = if (rational.denominator != 0) {
+                    rational.numerator.toFloat() / rational.denominator.toFloat()
+                } else {
+                    1f
+                }
+                range.lower..range.upper
+            } else {
+                null
+            }
+            evIndex = 0
+            evTarget = null
+            focusTarget = null
+
+            // Kick an initial AF/AE cycle so the camera converges right after
+            // startup instead of waiting for the user's first tap.
+            if (!mfEnabled && previewView.width > 0 && previewView.height > 0) {
+                delay(450)
+                runCatching {
+                    val factory = previewView.meteringPointFactory
+                    val point = factory.createPoint(
+                        previewView.width / 2f,
+                        previewView.height / 2f
+                    )
+                    cam.cameraControl.startFocusAndMetering(
+                        FocusMeteringAction.Builder(point)
+                            .setAutoCancelDuration(3, TimeUnit.SECONDS)
+                            .build()
+                    )
+                }
+            }
+
             // Warm up segmentation models early (triggers the one-time
             // Play services download for the subject model).
             launch { SegmentationManager.warmup() }
@@ -284,32 +423,68 @@ fun CameraScreen() {
         camera?.cameraControl?.enableTorch(flashMode == FlashMode.TORCH)
     }
 
-    // ----- manual focus (focal distance) -----
+    // ----- manual focus + hardware noise reduction (one shared override) -----
+    // NOTE: Camera2CameraControl.setCaptureRequestOptions REPLACES all
+    // previously set options, so the noise-reduction mode must be part of the
+    // same options set as the manual focus keys or it would be dropped.
     LaunchedEffect(mfEnabled, camera, minFocusDistance) {
         val cam = camera ?: return@LaunchedEffect
         val c2 = Camera2CameraControl.from(cam.cameraControl)
+        val nrHighQuality = runCatching {
+            Camera2CameraInfo.from(cam.cameraInfo)
+                .getCameraCharacteristic(
+                    CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES
+                )
+                ?.contains(CameraMetadata.NOISE_REDUCTION_MODE_HIGH_QUALITY) ?: false
+        }.getOrDefault(false)
+
         if (mfEnabled && (minFocusDistance ?: 0f) > 0f) {
+            // Going manual: drop any running AF metering first.
+            runCatching { cam.cameraControl.cancelFocusAndMetering() }
             snapshotFlow { mfDiopters }
                 .collectLatest { diopters ->
-                    delay(60)
+                    delay(50)
                     runCatching {
-                        c2.setCaptureRequestOptions(
-                            CaptureRequestOptions.Builder()
-                                .setCaptureRequestOption(
-                                    CaptureRequest.CONTROL_AF_MODE,
-                                    CameraMetadata.CONTROL_AF_MODE_OFF
-                                )
-                                .setCaptureRequestOption(
-                                    CaptureRequest.LENS_FOCUS_DISTANCE,
-                                    diopters
-                                )
-                                .build()
-                        ).await()
+                        val builder = CaptureRequestOptions.Builder()
+                        if (nrHighQuality) {
+                            builder.setCaptureRequestOption(
+                                CaptureRequest.NOISE_REDUCTION_MODE,
+                                CameraMetadata.NOISE_REDUCTION_MODE_HIGH_QUALITY
+                            )
+                        }
+                        builder.setCaptureRequestOption(
+                            CaptureRequest.CONTROL_AF_MODE,
+                            CameraMetadata.CONTROL_AF_MODE_OFF
+                        )
+                        builder.setCaptureRequestOption(
+                            CaptureRequest.LENS_FOCUS_DISTANCE,
+                            diopters
+                        )
+                        c2.setCaptureRequestOptions(builder.build()).await()
                     }
                 }
         } else {
-            runCatching { c2.clearCaptureRequestOptions().await() }
+            if (nrHighQuality) {
+                runCatching {
+                    val builder = CaptureRequestOptions.Builder()
+                        .setCaptureRequestOption(
+                            CaptureRequest.NOISE_REDUCTION_MODE,
+                            CameraMetadata.NOISE_REDUCTION_MODE_HIGH_QUALITY
+                        )
+                    c2.setCaptureRequestOptions(builder.build()).await()
+                }
+            } else {
+                runCatching { c2.clearCaptureRequestOptions().await() }
+            }
         }
+    }
+
+    // Auto-hide the EV slider (and its focus ring) after a quiet period.
+    LaunchedEffect(evTarget, evLastInteraction) {
+        if (evTarget == null) return@LaunchedEffect
+        delay(6000)
+        evTarget = null
+        focusTarget = null
     }
 
     if (!hasCameraPermission) {
@@ -360,23 +535,26 @@ fun CameraScreen() {
         PortraitStage.ENHANCE -> context.getString(R.string.stage_enhance)
     }
 
-    /** 3-frame HDR bracket: EV 0 / -2 / +2, fused with ghost-aware weights. */
+    /**
+     * 3-frame HDR bracket centered on the user's current EV bias:
+     * userEV / userEV-2 / userEV+2, fused with ghost-aware weights.
+     */
     suspend fun captureHdrBracket(cam: Camera): Bitmap? {
         val control = cam.cameraControl
         val evState = cam.cameraInfo.exposureState
         val stepRational = evState.exposureCompensationStep
+        if (stepRational.denominator == 0) return null
         val step = stepRational.numerator.toFloat() / stepRational.denominator.toFloat()
         if (step <= 0f) return null
         val range = evState.exposureCompensationRange
+        val baseIdx = evIndex.coerceIn(range.lower, range.upper)
 
         fun indexFor(stops: Float): Int =
-            (stops / step).roundToInt().coerceIn(range.lower, range.upper)
+            (baseIdx + (stops / step).roundToInt()).coerceIn(range.lower, range.upper)
 
         suspend fun shotAt(stops: Float): Pair<ByteArray, Int>? {
-            if (stops != 0f) {
-                runCatching { control.setExposureCompensationIndex(indexFor(stops)).await() }
-                delay(320)
-            }
+            runCatching { control.setExposureCompensationIndex(indexFor(stops)).await() }
+            delay(320)
             return takePictureBytes()
         }
 
@@ -386,7 +564,8 @@ fun CameraScreen() {
         val evMinus = shotAt(-2f)
         processingStage = context.getString(R.string.hdr_capturing, 3, 3)
         val evPlus = shotAt(2f)
-        runCatching { control.setExposureCompensationIndex(0).await() }
+        // Restore the user's EV bias, not flat zero.
+        runCatching { control.setExposureCompensationIndex(baseIdx).await() }
 
         val shots = listOfNotNull(ev0, evMinus, evPlus)
         if (shots.isEmpty()) return null
@@ -424,7 +603,7 @@ fun CameraScreen() {
             processingStage = context.getString(R.string.stage_detect)
             when (val result = PortraitProcessor.process(
                 prepared,
-                settings.bokehStrength * 1.5f,
+                bokehLocal * 1.5f,
                 settings.autoEnhance
             ) { stage ->
                 withContext(Dispatchers.Main) { processingStage = stageText(stage) }
@@ -510,8 +689,10 @@ fun CameraScreen() {
             }.getOrDefault(false)
 
         scope.launch {
-            val captured: Bitmap? = if (hdrPossible && cam != null) {
-                captureHdrBracket(cam)
+            var captured: Bitmap? = null
+
+            if (hdrPossible && cam != null) {
+                captured = captureHdrBracket(cam)
             } else {
                 val shot = takePictureBytes()
                 if (shot == null) {
@@ -520,7 +701,43 @@ fun CameraScreen() {
                     toastRes = R.string.capture_failed
                     return@launch
                 }
-                decodeShot(shot.first, shot.second, captureCapPixels())
+
+                // Low light? Fire a quick burst and fuse it — that is the
+                // only way to genuinely cut noise (~sqrt(N) SNR gain).
+                val nightWanted = flashMode == FlashMode.OFF &&
+                    (ambientLuma?.let { it < NightDenoise.LOW_LIGHT_LUMA } ?: false)
+
+                if (nightWanted) {
+                    processingStage = context.getString(R.string.night_capturing)
+                    val extras = (0 until NightDenoise.EXTRA_FRAMES).mapNotNull {
+                        takePictureBytes()
+                    }
+                    if (extras.isNotEmpty()) {
+                        processingStage = context.getString(R.string.night_fusing)
+                        val nightCap = minOf(
+                            NightDenoise.MAX_FUSION_PIXELS,
+                            safeBitmapPixelBudget() / 2
+                        )
+                        captured = withContext(Dispatchers.Default) {
+                            NightDenoise.fuseFromJpegs(listOf(shot) + extras, nightCap)
+                        }
+                    }
+                }
+
+                if (captured == null) {
+                    captured = decodeShot(shot.first, shot.second, captureCapPixels())
+                    // Single-frame fallback: at least clean the chroma noise.
+                    val single = captured
+                    if (nightWanted && single != null) {
+                        captured = withContext(Dispatchers.Default) {
+                            if (NightDenoise.isLowLightBitmap(single)) {
+                                NightDenoise.denoiseSingle(single)
+                            } else {
+                                single
+                            }
+                        }
+                    }
+                }
             }
 
             if (captured == null) {
@@ -531,7 +748,7 @@ fun CameraScreen() {
             }
 
             try {
-                processAndSave(captured)
+                processAndSave(captured!!)
             } catch (t: Throwable) {
                 isProcessing = false
                 processingStage = null
@@ -541,7 +758,10 @@ fun CameraScreen() {
     }
 
     // ----- layout -----
-    Box(
+    val isNightScene = flashMode == FlashMode.OFF &&
+        (ambientLuma?.let { it < NightDenoise.LOW_LIGHT_LUMA } ?: false)
+
+    BoxWithConstraints(
         modifier = Modifier
             .fillMaxSize()
             .background(Color.Black)
@@ -555,12 +775,38 @@ fun CameraScreen() {
                     detectTapGestures { offset: Offset ->
                         val cam = camera ?: return@detectTapGestures
                         if (mfEnabled) return@detectTapGestures
+                        val id = System.nanoTime()
+                        focusTarget = FocusTarget(
+                            offset.x, offset.y, id, FocusResult.PENDING
+                        )
+                        // The EV slider anchors right next to the ring.
+                        evTarget = offset
+                        evLastInteraction = SystemClock.uptimeMillis()
+
                         val factory = previewView.meteringPointFactory
                         val point = factory.createPoint(offset.x, offset.y)
-                        cam.cameraControl.startFocusAndMetering(
-                            FocusMeteringAction.Builder(point).build()
-                        )
-                        focusTarget = FocusTarget(offset.x, offset.y, System.nanoTime())
+                        val action = FocusMeteringAction.Builder(point)
+                            .setAutoCancelDuration(4, TimeUnit.SECONDS)
+                            .build()
+                        val future = runCatching {
+                            cam.cameraControl.startFocusAndMetering(action)
+                        }.getOrNull()
+                        if (future == null) {
+                            focusTarget = focusTarget?.copy(result = FocusResult.SUCCESS)
+                        } else {
+                            scope.launch {
+                                val result = runCatching { future.await() }.getOrNull()
+                                if (focusTarget?.id == id) {
+                                    focusTarget = focusTarget?.copy(
+                                        result = if (result?.isFocusSuccessful == true) {
+                                            FocusResult.SUCCESS
+                                        } else {
+                                            FocusResult.FAIL
+                                        }
+                                    )
+                                }
+                            }
+                        }
                     }
                 }
                 .pointerInput(Unit) {
@@ -637,10 +883,34 @@ fun CameraScreen() {
             }
         }
 
-        FocusIndicator(
-            target = focusTarget,
-            onFinished = { focusTarget = null }
-        )
+        FocusIndicator(target = focusTarget)
+
+        // ----- GCam-style exposure slider (appears after tap-to-focus) -----
+        val currentEvRange = evRange
+        val currentAnchor = evTarget
+        if (currentAnchor != null && currentEvRange != null &&
+            currentEvRange.last > currentEvRange.first && !mfEnabled
+        ) {
+            EvSlider(
+                evIndex = evIndex,
+                minIndex = currentEvRange.first,
+                maxIndex = currentEvRange.last,
+                step = evStep,
+                anchor = currentAnchor,
+                areaWidthPx = constraints.maxWidth,
+                areaHeightPx = constraints.maxHeight,
+                onValueChange = { idx ->
+                    evLastInteraction = SystemClock.uptimeMillis()
+                    applyEv(idx)
+                },
+                onAutoReset = {
+                    evLastInteraction = SystemClock.uptimeMillis()
+                    haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                    applyEv(0)
+                },
+                onInteraction = { evLastInteraction = SystemClock.uptimeMillis() }
+            )
+        }
 
         // ----- manual focus slider -----
         AnimatedVisibility(
@@ -683,16 +953,22 @@ fun CameraScreen() {
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            if (zoomRatio > 1.02f) {
-                ZoomChip(
-                    zoom = zoomRatio,
-                    onReset = {
-                        zoomRatio = 1f
-                        camera?.cameraControl?.setZoomRatio(1f)
-                    }
-                )
-            } else {
-                Spacer(Modifier.width(48.dp))
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                if (zoomRatio > 1.02f) {
+                    ZoomChip(
+                        zoom = zoomRatio,
+                        onReset = {
+                            zoomRatio = 1f
+                            camera?.cameraControl?.setZoomRatio(1f)
+                        }
+                    )
+                }
+                if (isNightScene) {
+                    NightChip()
+                }
             }
             Row(
                 verticalAlignment = Alignment.CenterVertically,
@@ -746,9 +1022,10 @@ fun CameraScreen() {
             ) {
                 Column(horizontalAlignment = Alignment.CenterHorizontally) {
                     BokehSlider(
-                        strength = settings.bokehStrength,
-                        onChange = { value ->
-                            updateSettings { it.copy(bokehStrength = value) }
+                        strength = bokehLocal,
+                        onChange = { value -> bokehLocal = value },
+                        onDragFinished = {
+                            updateSettings { it.copy(bokehStrength = bokehLocal) }
                         },
                         modifier = Modifier
                             .fillMaxWidth(0.78f)

@@ -45,11 +45,15 @@ enum class PictureQuality(
     MAX("Max", 24_000_000, 97)
 }
 
+/** Outcome of a tap-to-focus AF cycle, used to color the focus ring. */
+enum class FocusResult { PENDING, SUCCESS, FAIL }
+
 /** A tap-to-focus event with a unique id so the indicator can re-animate. */
 data class FocusTarget(
     val x: Float,
     val y: Float,
-    val id: Long
+    val id: Long,
+    val result: FocusResult = FocusResult.PENDING
 )
 
 /** Live stage feedback while a portrait is being processed. */

@@ -4,14 +4,11 @@ import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectDragGestures
-import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxHeight
-import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
@@ -24,6 +21,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -39,14 +37,26 @@ import com.devfahim00.netcam.ui.theme.Accent
 import java.util.Locale
 import kotlin.math.roundToInt
 
-/** A slim glassy vertical slider (used for manual focus distance). */
+/**
+ * A slim glassy vertical slider (used for manual focus distance).
+ *
+ * Gesture handling notes: the drag callbacks must read the LATEST fraction /
+ * callbacks via [rememberUpdatedState]. Capturing the composable parameters
+ * directly inside [pointerInput] freezes them at first composition, which made
+ * the knob snap back to its initial position (the old "slider won't move" bug).
+ * Tap-to-jump and drag are handled in one detector so they never fight.
+ */
 @Composable
 fun GlassSliderVertical(
     fraction: Float,
     modifier: Modifier = Modifier,
-    onFractionChange: (Float) -> Unit
+    onFractionChange: (Float) -> Unit,
+    onDragFinished: (() -> Unit)? = null
 ) {
     var trackPx by remember { mutableFloatStateOf(1f) }
+    val currentFraction by rememberUpdatedState(fraction)
+    val currentOnChange by rememberUpdatedState(onFractionChange)
+    val currentOnFinished by rememberUpdatedState(onDragFinished)
 
     BoxWithConstraints(
         modifier = modifier
@@ -56,17 +66,19 @@ fun GlassSliderVertical(
             .glassBackground(shape = RoundedCornerShape(23.dp))
             .onSizeChanged { trackPx = it.height.toFloat().coerceAtLeast(1f) }
             .pointerInput(Unit) {
-                detectTapGestures { offset ->
-                    onFractionChange((offset.y / trackPx).coerceIn(0f, 1f))
-                }
-            }
-            .pointerInput(Unit) {
-                detectDragGestures { change, dragAmount ->
-                    change.consume()
-                    onFractionChange(
-                        (fraction + dragAmount.y / trackPx).coerceIn(0f, 1f)
-                    )
-                }
+                detectDragGestures(
+                    onDragStart = { offset ->
+                        currentOnChange((offset.y / trackPx).coerceIn(0f, 1f))
+                    },
+                    onDragEnd = { currentOnFinished?.invoke() },
+                    onDragCancel = { currentOnFinished?.invoke() },
+                    onDrag = { change, dragAmount ->
+                        change.consume()
+                        currentOnChange(
+                            (currentFraction + dragAmount.y / trackPx).coerceIn(0f, 1f)
+                        )
+                    }
+                )
             }
     ) {
         val knobSize = 30.dp
@@ -108,14 +120,23 @@ fun focusDistanceLabel(diopters: Float, maxDiopters: Float): String {
     }
 }
 
-/** Horizontal glass slider with a leading label (used for bokeh strength). */
+/**
+ * Horizontal glass slider with a leading label (used for bokeh strength).
+ * Same rememberUpdatedState gesture fix as [GlassSliderVertical]; persistence
+ * is delegated to [onDragFinished] so we don't write SharedPreferences on
+ * every animation frame of a drag.
+ */
 @Composable
 fun GlassSliderHorizontal(
     fraction: Float,
     modifier: Modifier = Modifier,
-    onFractionChange: (Float) -> Unit
+    onFractionChange: (Float) -> Unit,
+    onDragFinished: (() -> Unit)? = null
 ) {
     var trackPx by remember { mutableFloatStateOf(1f) }
+    val currentFraction by rememberUpdatedState(fraction)
+    val currentOnChange by rememberUpdatedState(onFractionChange)
+    val currentOnFinished by rememberUpdatedState(onDragFinished)
 
     BoxWithConstraints(
         modifier = modifier
@@ -124,17 +145,19 @@ fun GlassSliderHorizontal(
             .glassBackground(shape = RoundedCornerShape(20.dp))
             .onSizeChanged { trackPx = it.width.toFloat().coerceAtLeast(1f) }
             .pointerInput(Unit) {
-                detectTapGestures { offset ->
-                    onFractionChange((offset.x / trackPx).coerceIn(0f, 1f))
-                }
-            }
-            .pointerInput(Unit) {
-                detectDragGestures { change, dragAmount ->
-                    change.consume()
-                    onFractionChange(
-                        (fraction + dragAmount.x / trackPx).coerceIn(0f, 1f)
-                    )
-                }
+                detectDragGestures(
+                    onDragStart = { offset ->
+                        currentOnChange((offset.x / trackPx).coerceIn(0f, 1f))
+                    },
+                    onDragEnd = { currentOnFinished?.invoke() },
+                    onDragCancel = { currentOnFinished?.invoke() },
+                    onDrag = { change, dragAmount ->
+                        change.consume()
+                        currentOnChange(
+                            (currentFraction + dragAmount.x / trackPx).coerceIn(0f, 1f)
+                        )
+                    }
+                )
             }
     ) {
         val knobSize = 26.dp
@@ -168,7 +191,8 @@ fun GlassSliderHorizontal(
 fun BokehSlider(
     strength: Float,
     modifier: Modifier = Modifier,
-    onChange: (Float) -> Unit
+    onChange: (Float) -> Unit,
+    onDragFinished: (() -> Unit)? = null
 ) {
     Row(
         modifier = modifier
@@ -187,6 +211,7 @@ fun BokehSlider(
         GlassSliderHorizontal(
             fraction = strength,
             onFractionChange = onChange,
+            onDragFinished = onDragFinished,
             modifier = Modifier
                 .weight(1f)
                 .height(24.dp)

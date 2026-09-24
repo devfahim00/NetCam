@@ -1,5 +1,6 @@
 package com.devfahim00.netcam.ui.components
 
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -24,6 +25,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
@@ -130,6 +133,42 @@ fun SettingsButton(
             contentDescription = stringResource(R.string.cd_settings),
             tint = Color.White.copy(alpha = 0.92f),
             modifier = Modifier.size(20.dp)
+        )
+    }
+}
+
+/** Small "night mode active" pill shown when the scene is dark. */
+@Composable
+fun NightChip(
+    modifier: Modifier = Modifier
+) {
+    Row(
+        modifier = modifier
+            .clip(RoundedCornerShape(percent = 50))
+            .glassBackground(
+                shape = RoundedCornerShape(percent = 50),
+                tintAlpha = 0.26f
+            )
+            .padding(horizontal = 12.dp, vertical = 9.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        Canvas(Modifier.size(11.dp)) {
+            // Crescent moon.
+            drawArc(
+                color = Accent,
+                startAngle = 110f,
+                sweepAngle = 260f,
+                useCenter = false,
+                style = Stroke(width = 1.8.dp.toPx(), cap = StrokeCap.Round)
+            )
+        }
+        Text(
+            text = stringResource(R.string.night_chip),
+            fontSize = 12.sp,
+            fontWeight = FontWeight.Bold,
+            letterSpacing = 0.6.sp,
+            color = Accent
         )
     }
 }

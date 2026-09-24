@@ -11,8 +11,8 @@ android {
         applicationId = "com.devfahim00.netcam"
         minSdk = 24
         targetSdk = 34
-        versionCode = 2
-        versionName = "1.1.0"
+        versionCode = 3
+        versionName = "1.2.0"
 
         // The bundled selfie-segmentation model ships large MediaPipe native
         // libraries per ABI. All phones released since 2019 are arm64, so we

@@ -17,17 +17,24 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
+import com.devfahim00.netcam.camera.FocusResult
 import com.devfahim00.netcam.camera.FocusTarget
 import com.devfahim00.netcam.ui.theme.Accent
-import kotlinx.coroutines.delay
 import kotlin.math.roundToInt
 
-/** Animated focus ring shown at the tap position. */
+/** Focus-converged green / failed red, GCam style. */
+val FocusSuccess = Color(0xFF8CE99A)
+val FocusFail = Color(0xFFFF6B6B)
+
+/**
+ * Animated focus ring shown at the tap position. Stays on screen while the
+ * exposure slider is visible (parent controls removal) and reports AF result
+ * through its color: white = metering, green = locked, red = failed.
+ */
 @Composable
 fun FocusIndicator(
     target: FocusTarget?,
-    modifier: Modifier = Modifier,
-    onFinished: () -> Unit
+    modifier: Modifier = Modifier
 ) {
     if (target == null) return
 
@@ -40,9 +47,20 @@ fun FocusIndicator(
             scale.snapTo(1.4f)
             alpha.animateTo(1f, tween(110))
             scale.animateTo(1f, tween(240, easing = FastOutSlowInEasing))
-            delay(420)
-            alpha.animateTo(0f, tween(200))
-            onFinished()
+        }
+
+        // Confirmation pulse when the AF result arrives.
+        LaunchedEffect(target.id, target.result) {
+            if (target.result != FocusResult.PENDING) {
+                scale.snapTo(1.14f)
+                scale.animateTo(1f, tween(200, easing = FastOutSlowInEasing))
+            }
+        }
+
+        val ringColor = when (target.result) {
+            FocusResult.PENDING -> Color.White
+            FocusResult.SUCCESS -> FocusSuccess
+            FocusResult.FAIL -> FocusFail
         }
 
         Canvas(
@@ -63,17 +81,17 @@ fun FocusIndicator(
             val stroke = 2.4.dp.toPx()
             val radius = size.minDimension / 2f - stroke
             drawCircle(
-                color = Color.White,
+                color = ringColor,
                 radius = radius,
                 style = Stroke(width = stroke)
             )
             drawCircle(color = Accent, radius = 2.5.dp.toPx(), center = center)
             val tick = 12f
             val thin = stroke * 0.7f
-            drawLine(Color.White, Offset(center.x - radius, center.y), Offset(center.x - radius + tick, center.y), thin)
-            drawLine(Color.White, Offset(center.x + radius, center.y), Offset(center.x + radius - tick, center.y), thin)
-            drawLine(Color.White, Offset(center.x, center.y - radius), Offset(center.x, center.y - radius + tick), thin)
-            drawLine(Color.White, Offset(center.x, center.y + radius), Offset(center.x, center.y + radius - tick), thin)
+            drawLine(ringColor, Offset(center.x - radius, center.y), Offset(center.x - radius + tick, center.y), thin)
+            drawLine(ringColor, Offset(center.x + radius, center.y), Offset(center.x + radius - tick, center.y), thin)
+            drawLine(ringColor, Offset(center.x, center.y - radius), Offset(center.x, center.y - radius + tick), thin)
+            drawLine(ringColor, Offset(center.x, center.y + radius), Offset(center.x, center.y + radius - tick), thin)
         }
     }
 }
