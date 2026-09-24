@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">NetCam</string>
+
+    <!-- Permission screen -->
+    <string name="camera_permission_title">Camera access needed</string>
+    <string name="camera_permission_body">NetCam needs camera access to take photos and apply portrait effects. Your photos never leave your device.</string>
+    <string name="grant_camera">Grant access</string>
+    <string name="open_settings">Open settings</string>
+
+    <!-- Modes -->
+    <string name="mode_photo">Photo</string>
+    <string name="mode_portrait">Portrait</string>
+    <string name="portrait_hint">Auto subject detection · depth blur</string>
+
+    <!-- Flash -->
+    <string name="flash_off">Off</string>
+    <string name="flash_auto">Auto</string>
+    <string name="flash_on">On</string>
+    <string name="flash_torch">Torch</string>
+
+    <!-- Capture / processing -->
+    <string name="processing_portrait">Processing portrait…</string>
+    <string name="processing_subtitle">Detecting subject &amp; applying depth blur</string>
+    <string name="saved_to_gallery">Saved to gallery</string>
+    <string name="portrait_saved">Portrait saved</string>
+    <string name="capture_failed">Capture failed</string>
+    <string name="save_failed">Could not save photo</string>
+    <string name="subject_not_found">No clear subject detected — saved without blur</string>
+    <string name="portrait_unavailable">Portrait effect unavailable — saved without blur</string>
+    <string name="no_gallery_app">No gallery app found</string>
+    <string name="camera_error">Could not start camera</string>
+
+    <!-- Content descriptions -->
+    <string name="cd_capture_photo">Capture photo</string>
+    <string name="cd_switch_camera">Switch camera</string>
+    <string name="cd_gallery">Open gallery</string>
+    <string name="cd_flash_mode">Flash mode</string>
+</resources>
