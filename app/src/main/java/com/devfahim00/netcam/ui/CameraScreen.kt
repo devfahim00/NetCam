@@ -120,6 +120,7 @@ import com.devfahim00.netcam.ui.components.GlassSliderVertical
 import com.devfahim00.netcam.ui.components.GlassSurface
 import com.devfahim00.netcam.ui.components.HdrChip
 import com.devfahim00.netcam.ui.components.ModeSelector
+import com.devfahim00.netcam.ui.components.MoreToggleButton
 import com.devfahim00.netcam.ui.components.NightChip
 import com.devfahim00.netcam.ui.components.SettingsButton
 import com.devfahim00.netcam.ui.components.SettingsSheet
@@ -208,6 +209,7 @@ fun CameraScreen() {
     var focusTarget by remember { mutableStateOf<FocusTarget?>(null) }
     var toastRes by remember { mutableStateOf<Int?>(null) }
     var showSettings by remember { mutableStateOf(false) }
+    var showQuickSettings by rememberSaveable { mutableStateOf(false) }
 
     // Manual focus state (diopters; 0 = infinity).
     var mfEnabled by remember { mutableStateOf(false) }
@@ -945,66 +947,94 @@ fun CameraScreen() {
         }
 
         // ----- top bar -----
-        Row(
+        // Kept deliberately minimal (flash + one "more" chevron) so it never
+        // turns into a wall of chips. Aspect ratio / HDR / focus mode /
+        // settings live in a slide-down row that only appears on demand.
+        Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .statusBarsPadding()
-                .padding(horizontal = 16.dp, vertical = 12.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
+                .padding(horizontal = 16.dp, vertical = 12.dp)
         ) {
             Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                if (zoomRatio > 1.02f) {
-                    ZoomChip(
-                        zoom = zoomRatio,
-                        onReset = {
-                            zoomRatio = 1f
-                            camera?.cameraControl?.setZoomRatio(1f)
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    if (zoomRatio > 1.02f) {
+                        ZoomChip(
+                            zoom = zoomRatio,
+                            onReset = {
+                                zoomRatio = 1f
+                                camera?.cameraControl?.setZoomRatio(1f)
+                            }
+                        )
+                    }
+                    if (isNightScene) {
+                        NightChip()
+                    }
+                }
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    FlashPill(
+                        flashMode = flashMode,
+                        onCycle = {
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            flashMode = flashMode.next()
                         }
                     )
-                }
-                if (isNightScene) {
-                    NightChip()
-                }
-            }
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                AspectChip(
-                    aspect = settings.aspect,
-                    onCycle = {
-                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                        updateSettings { it.copy(aspect = it.aspect.next()) }
-                    }
-                )
-                HdrChip(
-                    enabled = settings.hdr,
-                    onToggle = {
-                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                        updateSettings { it.copy(hdr = !it.hdr) }
-                    }
-                )
-                if ((minFocusDistance ?: 0f) > 0f) {
-                    FocusModeChip(
-                        manual = mfEnabled,
+                    MoreToggleButton(
+                        expanded = showQuickSettings,
                         onToggle = {
                             haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                            mfEnabled = !mfEnabled
+                            showQuickSettings = !showQuickSettings
                         }
                     )
                 }
-                FlashPill(
-                    flashMode = flashMode,
-                    onCycle = {
-                        haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                        flashMode = flashMode.next()
+            }
+            AnimatedVisibility(
+                visible = showQuickSettings,
+                enter = fadeIn(tween(160)),
+                exit = fadeOut(tween(120))
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 10.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    AspectChip(
+                        aspect = settings.aspect,
+                        onCycle = {
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            updateSettings { it.copy(aspect = it.aspect.next()) }
+                        }
+                    )
+                    HdrChip(
+                        enabled = settings.hdr,
+                        onToggle = {
+                            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                            updateSettings { it.copy(hdr = !it.hdr) }
+                        }
+                    )
+                    if ((minFocusDistance ?: 0f) > 0f) {
+                        FocusModeChip(
+                            manual = mfEnabled,
+                            onToggle = {
+                                haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+                                mfEnabled = !mfEnabled
+                            }
+                        )
                     }
-                )
-                SettingsButton(onClick = { showSettings = true })
+                    SettingsButton(onClick = { showSettings = true })
+                }
             }
         }
 

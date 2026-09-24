@@ -48,11 +48,17 @@ object BokehCompositor {
         val halfH = (h / 2).coerceAtLeast(1)
 
         // --- 1) Three blur layers from the half-res background ---
+        // Highlights are boosted before blurring so bright background points
+        // (fairy lights, sun glints, specular reflections) bloom into the
+        // glowing "bokeh discs" real wide-aperture lenses produce, instead of
+        // just softly smearing — this is most of what separates a flat phone
+        // blur from a GCam-grade one.
         val bgHalf = Bitmap.createScaledBitmap(base, halfW, halfH, true)
+        val bgHalfBloom = boostHighlights(bgHalf)
         val s = 0.45f + 0.85f * strength
-        val l1 = fastBlur(bgHalf, 2.6f * s, 64)
-        val l2 = fastBlur(bgHalf, 6.0f * s, 40)
-        val l3 = fastBlur(bgHalf, 11.5f * s, 26)
+        val l1 = fastBlur(bgHalfBloom, 2.6f * s, 64)
+        val l2 = fastBlur(bgHalfBloom, 6.0f * s, 40)
+        val l3 = fastBlur(bgHalfBloom, 11.5f * s, 26)
 
         val p1 = IntArray(halfW * halfH)
         val p2 = IntArray(halfW * halfH)
@@ -104,6 +110,36 @@ object BokehCompositor {
         Canvas(output).drawBitmap(maskedBg, 0f, 0f, Paint(Paint.FILTER_BITMAP_FLAG))
         return output
     }
+
+    /**
+     * Pushes pixels above [THRESHOLD] luminance brighter (up to [GAIN]x) so
+     * they survive blurring as bright discs rather than washing into the
+     * average grey of everything around them.
+     */
+    private fun boostHighlights(src: Bitmap): Bitmap {
+        val w = src.width
+        val h = src.height
+        val px = IntArray(w * h)
+        src.getPixels(px, 0, w, 0, 0, w, h)
+        for (i in px.indices) {
+            val c = px[i]
+            val r = (c shr 16) and 0xFF
+            val g = (c shr 8) and 0xFF
+            val b = c and 0xFF
+            val lum = (0.299f * r + 0.587f * g + 0.114f * b) / 255f
+            if (lum > THRESHOLD) {
+                val boost = 1f + (lum - THRESHOLD) / (1f - THRESHOLD) * (GAIN - 1f)
+                val nr = (r * boost).toInt().coerceIn(0, 255)
+                val ng = (g * boost).toInt().coerceIn(0, 255)
+                val nb = (b * boost).toInt().coerceIn(0, 255)
+                px[i] = (0xFF shl 24) or (nr shl 16) or (ng shl 8) or nb
+            }
+        }
+        return Bitmap.createBitmap(px, w, h, Bitmap.Config.ARGB_8888)
+    }
+
+    private const val THRESHOLD = 0.72f
+    private const val GAIN = 1.9f
 
     private fun blendChannel(c1: Int, c2: Int, c3: Int, w1: Float, w2: Float, w3: Float, shift: Int): Int {
         val v1 = ((c1 shr shift) and 0xFF) * w1

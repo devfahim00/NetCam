@@ -1,5 +1,7 @@
 package com.devfahim00.netcam.ui.components
 
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -24,8 +26,11 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
@@ -134,6 +139,53 @@ fun SettingsButton(
             tint = Color.White.copy(alpha = 0.92f),
             modifier = Modifier.size(20.dp)
         )
+    }
+}
+
+/**
+ * Compact chevron button that expands/collapses the secondary row of quick
+ * settings (aspect ratio, HDR, focus mode, settings). Keeps the always-on top
+ * bar down to just flash + this button, GCam-style, instead of a wall of
+ * chips fighting for attention.
+ */
+@Composable
+fun MoreToggleButton(
+    expanded: Boolean,
+    modifier: Modifier = Modifier,
+    onToggle: () -> Unit
+) {
+    val rotation by animateFloatAsState(
+        targetValue = if (expanded) 180f else 0f,
+        animationSpec = spring(dampingRatio = 0.75f, stiffness = 380f),
+        label = "moreChevronRotation"
+    )
+    GlassIconButton(
+        modifier = modifier,
+        size = 44.dp,
+        onClick = onToggle
+    ) {
+        Canvas(
+            modifier = Modifier
+                .size(14.dp)
+                .rotate(rotation)
+        ) {
+            val w = size.width
+            val h = size.height
+            val chevron = Path().apply {
+                moveTo(0f, h * 0.28f)
+                lineTo(w / 2f, h * 0.72f)
+                lineTo(w, h * 0.28f)
+            }
+            drawPath(
+                path = chevron,
+                color = Color.White.copy(alpha = 0.92f),
+                style = Stroke(
+                    width = 1.8.dp.toPx(),
+                    cap = StrokeCap.Round,
+                    join = StrokeJoin.Round
+                )
+            )
+        }
     }
 }
 
