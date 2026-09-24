@@ -19,9 +19,20 @@
     <string name="flash_on">On</string>
     <string name="flash_torch">Torch</string>
 
+    <!-- Quick chips -->
+    <string name="hdr_label">HDR</string>
+    <string name="af_label">AF</string>
+    <string name="mf_label">MF</string>
+
     <!-- Capture / processing -->
     <string name="processing_portrait">Processing portrait…</string>
-    <string name="processing_subtitle">Detecting subject &amp; applying depth blur</string>
+    <string name="processing_subtitle">AI subject detection &amp; depth blur</string>
+    <string name="stage_detect">Detecting subject…</string>
+    <string name="stage_refine">Refining edges…</string>
+    <string name="stage_bokeh">Applying depth blur…</string>
+    <string name="stage_enhance">Final touch-ups…</string>
+    <string name="hdr_capturing">Capturing HDR %1$d/%2$d</string>
+    <string name="hdr_fusing">Fusing exposures…</string>
     <string name="saved_to_gallery">Saved to gallery</string>
     <string name="portrait_saved">Portrait saved</string>
     <string name="capture_failed">Capture failed</string>
@@ -31,9 +42,22 @@
     <string name="no_gallery_app">No gallery app found</string>
     <string name="camera_error">Could not start camera</string>
 
+    <!-- Settings sheet -->
+    <string name="settings_title">Capture settings</string>
+    <string name="settings_aspect">Aspect ratio</string>
+    <string name="settings_hdr">HDR</string>
+    <string name="settings_hdr_hint">3-exposure fusion · needs flash off</string>
+    <string name="settings_quality">Picture quality</string>
+    <string name="settings_mirror">Mirror selfies</string>
+    <string name="settings_mirror_hint">Save front photos as seen in preview</string>
+    <string name="settings_enhance">Auto enhance</string>
+    <string name="settings_enhance_hint">Punchy, social-ready colors</string>
+    <string name="settings_footer">NetCam v1.1.0 · photos stay on your device</string>
+
     <!-- Content descriptions -->
     <string name="cd_capture_photo">Capture photo</string>
     <string name="cd_switch_camera">Switch camera</string>
     <string name="cd_gallery">Open gallery</string>
     <string name="cd_flash_mode">Flash mode</string>
+    <string name="cd_settings">Capture settings</string>
 </resources>

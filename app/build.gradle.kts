@@ -11,8 +11,16 @@ android {
         applicationId = "com.devfahim00.netcam"
         minSdk = 24
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "1.1.0"
+
+        // The bundled selfie-segmentation model ships large MediaPipe native
+        // libraries per ABI. All phones released since 2019 are arm64, so we
+        // keep a single lean APK for real devices (the app still installs on
+        // emulators; segmentation simply falls back gracefully there).
+        ndk {
+            abiFilters += listOf("arm64-v8a")
+        }
     }
 
     buildTypes {
@@ -70,8 +78,11 @@ dependencies {
     implementation("androidx.camera:camera-lifecycle:$cameraxVersion")
     implementation("androidx.camera:camera-view:$cameraxVersion")
 
-    // ML Kit Subject Segmentation (any-object portrait detection)
+    // ML Kit Subject Segmentation (any-object portrait detection, unbundled)
     implementation("com.google.android.gms:play-services-mlkit-subject-segmentation:16.0.0-beta1")
+
+    // ML Kit Selfie Segmentation (bundled, offline person mask — reliable fallback)
+    implementation("com.google.mlkit:segmentation-selfie:16.0.0-beta6")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
 }

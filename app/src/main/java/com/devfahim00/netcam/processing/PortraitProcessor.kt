@@ -1,10 +1,10 @@
 package com.devfahim00.netcam.processing
 
 import android.graphics.Bitmap
-import android.graphics.Canvas
-import android.graphics.Paint
-import android.graphics.Rect
-import com.devfahim00.netcam.util.fastBlur
+import com.devfahim00.netcam.camera.PortraitStage
+import com.devfahim00.netcam.util.bitmapToGrayFloat
+import com.devfahim00.netcam.util.fitToArea
+import com.devfahim00.netcam.util.safeBitmapPixelBudget
 import com.devfahim00.netcam.util.scaleLongestSideTo
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -17,66 +17,69 @@ sealed class PortraitResult {
 }
 
 /**
- * Professional-looking portrait effect:
+ * GCam-grade portrait pipeline:
  *
- *  1. cap the photo to a sane size (memory + speed on low-end devices)
- *  2. ML Kit subject segmentation -> subject cut-out with alpha matting
- *  3. pyramid-blur the full photo (strong, smooth, cheap bokeh)
- *  4. composite the sharp subject cut-out on top of the blurred background
+ *  1. detect the subject (multi-engine, see [SegmentationManager]),
+ *  2. refine the soft mask with an edge-aware guided filter + feathering
+ *     (see [MaskRefiner]) — this is what fixes jagged/haloed edges,
+ *  3. composite a depth-graded 3-layer bokeh behind the sharp subject
+ *     (see [BokehCompositor]) at capture resolution,
+ *  4. run the punchy "social-ready" color pipeline (see [PhotoEnhancer]).
  */
 object PortraitProcessor {
 
-    private const val MAX_OUTPUT_SIDE = 2560
-    private const val BLUR_DIVISOR = 11f
-    private const val BLUR_MIN_SIDE = 40
+    private const val WORKING_SIDE = 1280
 
-    suspend fun process(source: Bitmap): PortraitResult = withContext(Dispatchers.Default) {
-        val base = scaleLongestSideTo(source, MAX_OUTPUT_SIDE)
-
-        val foreground = SegmentationManager.subjectBitmap(base)
-            ?: return@withContext PortraitResult.Failed
-
-        if (!hasVisibleSubject(foreground)) {
-            return@withContext PortraitResult.NoSubject
-        }
-
+    /**
+     * @param source decoded, upright capture (any size).
+     * @param strength user bokeh strength, 0..1.5.
+     * @param enhance apply the punchy color pipeline.
+     * @param onStage invoked (on the main thread) as processing progresses.
+     */
+    suspend fun process(
+        source: Bitmap,
+        strength: Float,
+        enhance: Boolean,
+        onStage: suspend (PortraitStage) -> Unit = {}
+    ): PortraitResult = withContext(Dispatchers.Default) {
         try {
-            val blurred = fastBlur(base, BLUR_DIVISOR, BLUR_MIN_SIDE)
-            val output = blurred.copy(Bitmap.Config.ARGB_8888, true)
-            val canvas = Canvas(output)
-            val paint = Paint().apply { isFilterBitmap = true }
-            canvas.drawBitmap(
-                foreground,
-                null,
-                Rect(0, 0, output.width, output.height),
-                paint
+            onStage(PortraitStage.DETECT)
+
+            val base = source.fitToArea(safeBitmapPixelBudget())
+            val safeBase = if (base.config == Bitmap.Config.ARGB_8888) {
+                base
+            } else {
+                base.copy(Bitmap.Config.ARGB_8888, false)
+            }
+
+            val working = scaleLongestSideTo(safeBase, WORKING_SIDE)
+            val workW = working.width
+            val workH = working.height
+
+            val soft = SegmentationManager.detect(working)
+                ?: return@withContext PortraitResult.NoSubject
+
+            onStage(PortraitStage.REFINE)
+            val gray = bitmapToGrayFloat(working)
+            val alpha = MaskRefiner.refine(gray, soft.alpha, workW, workH)
+            if (MaskRefiner.coverage(alpha) < 0.004f) {
+                return@withContext PortraitResult.NoSubject
+            }
+            val dist = MaskRefiner.distanceField(
+                alpha, workW, workH, maxOf(workW, workH) / 6f
             )
+
+            onStage(PortraitStage.BOKEH)
+            var output = BokehCompositor.composite(safeBase, workW, workH, alpha, dist, strength)
+
+            if (enhance) {
+                onStage(PortraitStage.ENHANCE)
+                output = PhotoEnhancer.enhance(output, portrait = true)
+            }
+
             PortraitResult.Success(output)
         } catch (t: Throwable) {
             PortraitResult.Failed
         }
-    }
-
-    /** Samples the alpha channel to check the cut-out actually contains a subject. */
-    private fun hasVisibleSubject(bitmap: Bitmap): Boolean {
-        val w = bitmap.width
-        val h = bitmap.height
-        if (w <= 0 || h <= 0) return false
-
-        val pixels = IntArray(w * h)
-        bitmap.getPixels(pixels, 0, w, 0, 0, w, h)
-
-        val stride = maxOf(1, pixels.size / 4096)
-        var sampled = 0
-        var visible = 0
-        var i = 0
-        while (i < pixels.size) {
-            sampled++
-            if ((pixels[i] ushr 24) >= 128) visible++
-            i += stride
-        }
-        if (sampled == 0) return false
-        // Subject should cover at least ~0.5% of the frame to be believable.
-        return visible.toFloat() / sampled >= 0.005f
     }
 }

@@ -20,17 +20,16 @@ import java.util.Locale
 object ImageSaver {
 
     private const val FOLDER = "NetCam"
-    private const val JPEG_QUALITY = 96
 
-    fun saveBitmap(context: Context, bitmap: Bitmap): Uri? {
+    fun saveBitmap(context: Context, bitmap: Bitmap, jpegQuality: Int = 96): Uri? {
         val name = newFileName()
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             saveMediaStore(context, name) { out ->
-                bitmap.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, out)
+                bitmap.compress(Bitmap.CompressFormat.JPEG, jpegQuality, out)
             }
         } else {
             saveLegacy(context, name) { out ->
-                bitmap.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, out)
+                bitmap.compress(Bitmap.CompressFormat.JPEG, jpegQuality, out)
             }
         }
     }
