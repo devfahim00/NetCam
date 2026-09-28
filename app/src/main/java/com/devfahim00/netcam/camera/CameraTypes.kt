@@ -1,9 +1,47 @@
 package com.devfahim00.netcam.camera
 
+import android.hardware.camera2.CameraMetadata
+
 /** Capture modes supported by the camera. */
 enum class CameraMode {
     PHOTO,
-    PORTRAIT
+    PORTRAIT,
+    PRO
+}
+
+/** Composition grid drawn over the preview. */
+enum class GridOption(val label: String) {
+    OFF("Grid"),
+    THIRDS("3x3"),
+    FOURTHS("4x4");
+
+    fun next(): GridOption = when (this) {
+        OFF -> THIRDS
+        THIRDS -> FOURTHS
+        FOURTHS -> OFF
+    }
+}
+
+/** Self-timer delay. */
+enum class TimerOption(val seconds: Int, val label: String) {
+    OFF(0, "Timer"),
+    S3(3, "3s"),
+    S10(10, "10s");
+
+    fun next(): TimerOption = when (this) {
+        OFF -> S3
+        S3 -> S10
+        S10 -> OFF
+    }
+}
+
+/** Pro-mode white balance presets (mapped to Camera2 AWB modes). */
+enum class WhiteBalanceOption(val label: String, val awbMode: Int) {
+    AUTO("Auto", CameraMetadata.CONTROL_AWB_MODE_AUTO),
+    INCANDESCENT("2700K", CameraMetadata.CONTROL_AWB_MODE_INCANDESCENT),
+    FLUORESCENT("4000K", CameraMetadata.CONTROL_AWB_MODE_FLUORESCENT),
+    DAYLIGHT("5500K", CameraMetadata.CONTROL_AWB_MODE_DAYLIGHT),
+    CLOUDY("6500K", CameraMetadata.CONTROL_AWB_MODE_CLOUDY_DAYLIGHT)
 }
 
 /** Flash modes cycled through the flash pill. */

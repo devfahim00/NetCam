@@ -11,6 +11,7 @@
     <!-- Modes -->
     <string name="mode_photo">Photo</string>
     <string name="mode_portrait">Portrait</string>
+    <string name="mode_pro">Pro</string>
     <string name="portrait_hint">Auto subject detection · depth blur</string>
 
     <!-- Flash -->

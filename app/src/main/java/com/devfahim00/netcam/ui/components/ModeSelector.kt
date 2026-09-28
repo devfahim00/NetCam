@@ -27,9 +27,9 @@ import androidx.compose.ui.unit.sp
 import com.devfahim00.netcam.R
 import com.devfahim00.netcam.camera.CameraMode
 
-private val ModeItemWidth = 96.dp
+private val ModeItemWidth = 84.dp
 
-/** Photo / Portrait segmented control with a sliding glass pill. */
+/** Photo / Portrait / Pro segmented control with a sliding glass pill. */
 @Composable
 fun ModeSelector(
     mode: CameraMode,
@@ -44,7 +44,7 @@ fun ModeSelector(
     ) {
         Box {
             val pillOffset by animateDpAsState(
-                targetValue = if (mode == CameraMode.PHOTO) 0.dp else ModeItemWidth,
+                targetValue = ModeItemWidth * mode.ordinal,
                 animationSpec = spring(dampingRatio = 0.8f, stiffness = 600f),
                 label = "modePillOffset"
             )
@@ -64,6 +64,11 @@ fun ModeSelector(
                     label = stringResource(R.string.mode_portrait),
                     selected = mode == CameraMode.PORTRAIT,
                     onClick = { if (mode != CameraMode.PORTRAIT) onModeChange(CameraMode.PORTRAIT) }
+                )
+                ModeItem(
+                    label = stringResource(R.string.mode_pro),
+                    selected = mode == CameraMode.PRO,
+                    onClick = { if (mode != CameraMode.PRO) onModeChange(CameraMode.PRO) }
                 )
             }
         }
