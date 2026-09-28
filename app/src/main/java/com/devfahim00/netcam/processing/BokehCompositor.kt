@@ -8,7 +8,7 @@ import android.graphics.PorterDuffXfermode
 import android.graphics.Rect
 import com.devfahim00.netcam.util.alphaValuesToBitmap
 import com.devfahim00.netcam.util.bitmapToGrayFloat
-import com.devfahim00.netcam.util.fastBlur
+import com.devfahim00.netcam.util.smoothBlur
 import com.devfahim00.netcam.util.maskToBitmap
 
 /**
@@ -56,9 +56,9 @@ object BokehCompositor {
         val bgHalf = Bitmap.createScaledBitmap(base, halfW, halfH, true)
         val bgHalfBloom = boostHighlights(bgHalf)
         val s = 0.45f + 0.85f * strength
-        val l1 = fastBlur(bgHalfBloom, 2.6f * s, 64)
-        val l2 = fastBlur(bgHalfBloom, 6.0f * s, 40)
-        val l3 = fastBlur(bgHalfBloom, 11.5f * s, 26)
+        val l1 = smoothBlur(bgHalfBloom, 2.6f * s, 64)
+        val l2 = smoothBlur(bgHalfBloom, 6.0f * s, 40)
+        val l3 = smoothBlur(bgHalfBloom, 11.5f * s, 26)
 
         val p1 = IntArray(halfW * halfH)
         val p2 = IntArray(halfW * halfH)

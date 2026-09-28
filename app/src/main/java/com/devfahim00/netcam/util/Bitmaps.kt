@@ -77,6 +77,90 @@ fun fastBlur(src: Bitmap, blurDivisor: Float, minSide: Int): Bitmap {
     }
 }
 
+/**
+ * Smooth, artifact-free blur for portrait backgrounds.
+ *
+ * [fastBlur] shrinks the image and stretches it back with one bilinear
+ * upscale, which leaves visible blocky / pixelated patches in the result.
+ * This variant fixes that in three steps:
+ *  1. shrink progressively (area-averaging) to the intermediate size,
+ *  2. run a real 3-pass box blur (~Gaussian) on the small image, which
+ *     dissolves the individual low-res pixels,
+ *  3. enlarge back in gentle 2x steps instead of one big jump.
+ */
+fun smoothBlur(src: Bitmap, blurDivisor: Float, minSide: Int, radius: Int = 2): Bitmap {
+    require(src.width > 0 && src.height > 0) { "empty source bitmap" }
+
+    val targetW = (src.width / blurDivisor).toInt().coerceAtLeast(minSide)
+    val targetH = (src.height / blurDivisor).toInt().coerceAtLeast(minSide)
+
+    var current = src
+    while (current.width / 2 >= targetW && current.height / 2 >= targetH) {
+        current = Bitmap.createScaledBitmap(
+            current,
+            (current.width / 2).coerceAtLeast(1),
+            (current.height / 2).coerceAtLeast(1),
+            true
+        )
+    }
+    if (current.width == src.width && current.height == src.height) return src
+
+    // Real blur on the small image.
+    val sw = current.width
+    val sh = current.height
+    val a = IntArray(sw * sh)
+    val b = IntArray(sw * sh)
+    current.getPixels(a, 0, sw, 0, 0, sw, sh)
+    repeat(3) {
+        boxPass(a, b, sw, sh, 1, sw, radius)   // horizontal
+        boxPass(b, a, sh, sw, sw, 1, radius)   // vertical
+    }
+    var up = Bitmap.createBitmap(a, sw, sh, Bitmap.Config.ARGB_8888)
+
+    // Enlarge gradually so no single step exposes low-res blocks.
+    while (up.width * 2 < src.width && up.height * 2 < src.height) {
+        up = Bitmap.createScaledBitmap(up, up.width * 2, up.height * 2, true)
+    }
+    return Bitmap.createScaledBitmap(up, src.width, src.height, true)
+}
+
+/** One sliding-window box-blur pass over [lines] lines of [lineLen] pixels (edge-clamped). */
+private fun boxPass(
+    src: IntArray,
+    dst: IntArray,
+    lineLen: Int,
+    lines: Int,
+    step: Int,
+    lineStep: Int,
+    r: Int
+) {
+    val div = 2 * r + 1
+    val half = div / 2
+    for (l in 0 until lines) {
+        val base = l * lineStep
+        var sr = 0
+        var sg = 0
+        var sb = 0
+        for (k in -r..r) {
+            val c = src[base + k.coerceIn(0, lineLen - 1) * step]
+            sr += (c shr 16) and 0xFF
+            sg += (c shr 8) and 0xFF
+            sb += c and 0xFF
+        }
+        for (i in 0 until lineLen) {
+            dst[base + i * step] = (0xFF shl 24) or
+                (((sr + half) / div) shl 16) or
+                (((sg + half) / div) shl 8) or
+                ((sb + half) / div)
+            val add = src[base + (i + r + 1).coerceAtMost(lineLen - 1) * step]
+            val rem = src[base + (i - r).coerceAtLeast(0) * step]
+            sr += ((add shr 16) and 0xFF) - ((rem shr 16) and 0xFF)
+            sg += ((add shr 8) and 0xFF) - ((rem shr 8) and 0xFF)
+            sb += (add and 0xFF) - (rem and 0xFF)
+        }
+    }
+}
+
 /** Scales a bitmap so its longest side is at most [maxSide] (no-op if smaller). */
 fun scaleLongestSideTo(src: Bitmap, maxSide: Int): Bitmap {
     val longSide = maxOf(src.width, src.height)
