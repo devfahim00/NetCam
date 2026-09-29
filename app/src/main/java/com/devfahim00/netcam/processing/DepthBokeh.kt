@@ -5,10 +5,12 @@ import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.PorterDuff
 import android.graphics.PorterDuffXfermode
+import android.util.Log
 import com.devfahim00.netcam.util.alphaValuesToBitmap
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.pow
 import kotlin.math.roundToInt
 
 /**
@@ -33,8 +35,9 @@ import kotlin.math.roundToInt
 object DepthBokeh {
 
     private val RADII = floatArrayOf(0f, 2.5f, 5f, 8.5f, 13f, 19f, 27f)
-    private const val TOLERANCE = 0.06f      // in-focus depth slack
-    private const val RAMP = 0.65f           // depth distance for full blur
+    private const val TAG = "DepthBokeh"
+    private const val BAND_PAD = 0.05f        // extra in-focus slack around the subject's own depth range
+    private const val MIN_SPAN = 0.18f        // min depth span mapped to full blur (avoids over-amplifying noise)
     private const val FOREGROUND_SOFT = 0.75f
     private const val BLOOM_THRESHOLD = 0.72f
     private const val BLOOM_GAIN = 0.45f
@@ -85,26 +88,46 @@ object DepthBokeh {
         depth = MaskRefiner.guidedFilter(gray, depth, w, h, max(4, side / 40), 1.0e-3f)
         depth = MaskRefiner.guidedFilter(gray, depth, w, h, max(2, side / 160), 1.0e-4f)
 
-        // ---- 2) focus plane ----------------------------------------------
-        val focus = focusDepth(mask, depth, w, h)
+        // ---- 2) whole-subject region --------------------------------------
+        // (a) fill holes / gaps inside the segmentation mask,
+        // (b) measure the subject's own depth range,
+        // (c) grow the region over anything connected to it at the same depth
+        //     (hand, second object, table the object stands on, ...).
+        val filled = fillHoles(mask, w, h)
+        val focus = focusDepth(filled, depth, w, h)
+        val band = subjectBand(filled, depth, w, h, focus)
+        val bandLo = band[0]
+        val bandHi = band[1]
+        val region = subjectRegion(filled, depth, gray, w, h, bandLo, bandHi)
 
-        // ---- 3) circle of confusion ---------------------------------------
+        // ---- 3) circle of confusion from real depth ------------------------
+        // Blur ramps from 0 at the subject's depth band to 100% at the
+        // farthest (or nearest) depth actually present in the scene, so blur
+        // grows smoothly with distance instead of saturating everywhere.
+        val bgRef = depthPercentile(depth, region, n, 0.03f, 0f)
+        val fgRef = depthPercentile(depth, region, n, 0.97f, 1f)
+        val farSpan = max(bandLo - bgRef, MIN_SPAN)
+        val nearSpan = max(fgRef - bandHi, MIN_SPAN)
+        Log.d(TAG, "focus=$focus band=[$bandLo,$bandHi] bgRef=$bgRef fgRef=$fgRef " +
+            "maskCov=${cov(mask)} filledCov=${cov(filled)} regionCov=${cov(region)}")
+
         val maxCoc = 17f * strength * sScale
         val coc01 = FloatArray(n)
         for (i in 0 until n) {
-            val delta = depth[i] - focus
-            val ad = abs(delta)
-            val a = ad - TOLERANCE
-            var c = if (a <= 0f) 0f else min(a / RAMP, 1f)
-            if (delta > 0f) c *= FOREGROUND_SOFT
-            // Mask protects the subject, but only where it is also at (about)
-            // the focus depth — a knee pushed toward the lens still blurs.
-            val prot = mask[i] * smoothstep(0f, 0.10f, 0.20f - ad)
-            coc01[i] = c * (1f - prot)
+            val d = depth[i]
+            var c = 0f
+            if (d < bandLo) {
+                c = ((bandLo - d) / farSpan).coerceIn(0f, 1f)
+            } else if (d > bandHi) {
+                c = ((d - bandHi) / nearSpan).coerceIn(0f, 1f) * FOREGROUND_SOFT
+            }
+            // The whole subject region is protected -> never blurred inside.
+            coc01[i] = c * (1f - region[i])
         }
         val cocFiltered = MaskRefiner.guidedFilter(gray, coc01, w, h, 4, 1.0e-4f)
         val coc = FloatArray(n)
-        for (i in 0 until n) coc[i] = cocFiltered[i].coerceIn(0f, 1f) * maxCoc
+        // Re-apply protection after filtering so blur can never creep into the subject.
+        for (i in 0 until n) coc[i] = cocFiltered[i].coerceIn(0f, 1f) * (1f - region[i]) * maxCoc
 
         // ---- 4) blur level per pixel -------------------------------------
         val radii = FloatArray(RADII.size) { RADII[it] * strength * sScale }
@@ -247,6 +270,150 @@ object DepthBokeh {
             val v = if (d > 1e-4f) num[i] / d else prev[i]
             cur[i] = (v * a + prev[i] * (1f - a)).coerceIn(0f, 255f * 2f)
         }
+    }
+
+    private fun cov(a: FloatArray): Float {
+        var c = 0
+        for (v in a) if (v > 0.5f) c++
+        return if (a.isEmpty()) 0f else c.toFloat() / a.size
+    }
+
+    /**
+     * Fills holes inside the subject mask: anything not reachable from the
+     * image border through non-subject pixels is inside the subject. A small
+     * morphological closing then bridges thin cracks in the middle.
+     */
+    private fun fillHoles(mask: FloatArray, w: Int, h: Int): FloatArray {
+        val n = w * h
+        val bin = BooleanArray(n) { mask[it] > 0.5f }
+        // flood-fill the outside from the border
+        val outside = BooleanArray(n)
+        val q = IntArray(n)
+        var qh = 0
+        var qt = 0
+        fun push(i: Int) {
+            if (!bin[i] && !outside[i]) { outside[i] = true; q[qt++] = i }
+        }
+        for (x in 0 until w) { push(x); push((h - 1) * w + x) }
+        for (y in 0 until h) { push(y * w); push(y * w + w - 1) }
+        while (qh < qt) {
+            val i = q[qh++]
+            val x = i % w
+            val y = i / w
+            if (x > 0) push(i - 1)
+            if (x < w - 1) push(i + 1)
+            if (y > 0) push(i - w)
+            if (y < h - 1) push(i + w)
+        }
+        val solid = FloatArray(n) { if (bin[it] || !outside[it]) 1f else 0f }
+
+        // closing = dilate then erode
+        val r = max(3, max(w, h) / 120)
+        val dil = MaskRefiner.boxFilter(solid, w, h, r)
+        val dilated = FloatArray(n) { if (dil[it] > 0.001f) 1f else 0f }
+        val ero = MaskRefiner.boxFilter(dilated, w, h, r)
+        val out = FloatArray(n)
+        for (i in 0 until n) {
+            val closed = if (ero[i] > 0.999f) 1f else 0f
+            out[i] = max(mask[i], max(solid[i], closed))
+        }
+        return out
+    }
+
+    /** Robust depth range of the subject: 6th..94th percentile, padded. */
+    private fun subjectBand(filled: FloatArray, depth: FloatArray, w: Int, h: Int, focus: Float): FloatArray {
+        val n = w * h
+        var count = 0
+        for (i in 0 until n) if (filled[i] > 0.95f) count++
+        if (count < 50) return floatArrayOf(focus - BAND_PAD, focus + BAND_PAD)
+        val vals = FloatArray(count)
+        var j = 0
+        for (i in 0 until n) if (filled[i] > 0.95f) vals[j++] = depth[i]
+        vals.sort()
+        val p06 = vals[(count * 0.06f).toInt().coerceIn(0, count - 1)]
+        val p94 = vals[(count * 0.94f).toInt().coerceIn(0, count - 1)]
+        return floatArrayOf(min(p06, focus) - BAND_PAD, max(p94, focus) + BAND_PAD)
+    }
+
+    /**
+     * Final "keep sharp" region: the filled mask plus every pixel that is
+     * connected to it and lies inside the subject's depth band (limited to a
+     * padded bounding box). Guided-filtered so edges snap to the photo.
+     */
+    private fun subjectRegion(
+        filled: FloatArray, depth: FloatArray, gray: FloatArray,
+        w: Int, h: Int, lo: Float, hi: Float
+    ): FloatArray {
+        val n = w * h
+        var minX = w; var maxX = -1; var minY = h; var maxY = -1
+        for (y in 0 until h) {
+            val row = y * w
+            for (x in 0 until w) if (filled[row + x] > 0.5f) {
+                if (x < minX) minX = x
+                if (x > maxX) maxX = x
+                if (y < minY) minY = y
+                if (y > maxY) maxY = y
+            }
+        }
+        if (maxX < 0) return filled
+        val padX = (w * 0.08f).toInt()
+        val padY = (h * 0.08f).toInt()
+        val bx0 = max(0, minX - padX); val bx1 = min(w - 1, maxX + padX)
+        val by0 = max(0, minY - padY); val by1 = min(h - 1, maxY + padY)
+
+        val inReg = BooleanArray(n)
+        val q = IntArray(n)
+        var qh = 0
+        var qt = 0
+        for (i in 0 until n) if (filled[i] > 0.5f) { inReg[i] = true; q[qt++] = i }
+        val seedCount = qt
+        val gLo = lo - 0.02f
+        val gHi = hi + 0.02f
+        fun tryAdd(j: Int, x: Int, y: Int) {
+            if (inReg[j] || x < bx0 || x > bx1 || y < by0 || y > by1) return
+            val d = depth[j]
+            if (d in gLo..gHi) { inReg[j] = true; q[qt++] = j }
+        }
+        while (qh < qt) {
+            val i = q[qh++]
+            val x = i % w
+            val y = i / w
+            if (x > 0) tryAdd(i - 1, x - 1, y)
+            if (x < w - 1) tryAdd(i + 1, x + 1, y)
+            if (y > 0) tryAdd(i - w, x, y - 1)
+            if (y < h - 1) tryAdd(i + w, x, y + 1)
+        }
+        // Runaway growth (e.g. a wall at the subject's depth): keep the mask only.
+        val grownCount = qt
+        val runaway = grownCount > 2.5f * seedCount && grownCount > 0.55f * n
+        Log.d(TAG, "region seed=$seedCount grown=$grownCount runaway=$runaway")
+
+        val grown = FloatArray(n) { if (inReg[it]) 1f else 0f }
+        val smooth = MaskRefiner.boxFilter(grown, w, h, 2)
+        val out = FloatArray(n)
+        for (i in 0 until n) {
+            val g = if (!runaway && smooth[i] > 0.6f) 1f else 0f
+            out[i] = max(filled[i], g)
+        }
+        val side = max(w, h)
+        val snapped = MaskRefiner.guidedFilter(gray, out, w, h, max(2, side / 250), 1.0e-4f)
+        for (i in 0 until n) snapped[i] = max(snapped[i].coerceIn(0f, 1f), if (filled[i] > 0.9f) 1f else 0f)
+        return snapped
+    }
+
+    /** Percentile of depth over pixels outside [region]; [fallback] if too few. */
+    private fun depthPercentile(depth: FloatArray, region: FloatArray, n: Int, p: Float, fallback: Float): Float {
+        val stride = max(1, n / 60000)
+        var c = 0
+        var i = 0
+        while (i < n) { if (region[i] < 0.5f) c++; i += stride }
+        if (c < 100) return fallback
+        val vals = FloatArray(c)
+        var j = 0
+        i = 0
+        while (i < n) { if (region[i] < 0.5f) vals[j++] = depth[i]; i += stride }
+        vals.sort()
+        return vals[(c * p).toInt().coerceIn(0, c - 1)]
     }
 
     /**
