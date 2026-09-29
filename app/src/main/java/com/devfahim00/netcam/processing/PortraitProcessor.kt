@@ -84,7 +84,7 @@ object PortraitProcessor {
 
             if (enhance) {
                 onStage(PortraitStage.ENHANCE)
-                output = PhotoEnhancer.enhance(output!!, portrait = true)
+                output = PhotoEnhancer.enhanceSmart(output!!, portrait = true)
             }
 
             PortraitResult.Success(output!!)

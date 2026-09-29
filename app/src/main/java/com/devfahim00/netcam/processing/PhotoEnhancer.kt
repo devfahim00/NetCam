@@ -21,6 +21,11 @@ import kotlin.math.sqrt
  *  4. Soft S-curve contrast with a subtle shadow lift.
  *  5. Luma-only unsharp mask for crisp, share-ready detail.
  *
+ * Scene-aware pass ([SceneAnalyzer]): people/skin are gently smoothed and
+ * brightened, sky is deepened, greenery/water/sunsets get a targeted colour
+ * boost, whites stay clean, and denoise/sharpen adapt to flat vs detailed
+ * regions so noise is not amplified.
+ *
  * All work happens on a single pixel array with LUTs and row caching, so a
  * 12 MP photo processes in well under a second on mid-range silicon.
  */
@@ -40,9 +45,14 @@ object PhotoEnhancer {
     private const val MIN_GAMMA = 0.55f
     private const val BASE_GRID = 4          // local-luma base is w/4 x h/4
     private const val DENOISE_MAX_PIXELS = 3_000_000
+    private const val SKIN_SMOOTH = 0.55f
+    private const val SKIN_SMOOTH_MAX_PIXELS = 2_000_000
 
     /** @param portrait true → slightly gentler sharpening (subject already pops). */
-    fun enhance(src: Bitmap, portrait: Boolean): Bitmap {
+    suspend fun enhanceSmart(src: Bitmap, portrait: Boolean): Bitmap =
+        enhance(src, portrait, SceneAnalyzer.analyze(src))
+
+    fun enhance(src: Bitmap, portrait: Boolean, scene: SceneMap? = null): Bitmap {
         val w = src.width
         val h = src.height
         if (w < 2 || h < 2) return src
@@ -58,10 +68,10 @@ object PhotoEnhancer {
         val lift = 1f - gamma
         val noise = noiseLevel(pixels, w, h)
         val noiseN = ((noise - 0.4f) / 1.6f).coerceIn(0f, 1f)
-        val mix = (0.15f + 0.55f * noiseN + 0.8f * lift).coerceIn(0f, 0.92f)
-        Log.d(TAG, "median=$median gamma=$gamma noise=$noise mix=$mix")
-        if (mix > 0.2f) {
-            runCatching { denoiseGuided(pixels, w, h, mix, lift, noiseN) }
+        val mix = (0.20f + 0.65f * noiseN + 0.9f * lift).coerceIn(0f, 0.92f)
+        Log.d(TAG, "median=$median gamma=$gamma noise=$noise mix=$mix scene=${scene?.summary}")
+        if (mix > 0.18f) {
+            runCatching { denoiseGuided(pixels, w, h, mix, lift, noiseN, scene) }
         }
         applyExposure(pixels, gamma)
 
@@ -69,8 +79,11 @@ object PhotoEnhancer {
         val lumaBase = localLumaBase(pixels, w, h)
         val lut = buildToneLut()
 
-        toneAndColorPass(pixels, w, h, lut, lumaBase, gr, gg, gb)
-        sharpenPass(pixels, w, h, if (portrait) SHARPEN_PORTRAIT else SHARPEN_PHOTO)
+        toneAndColorPass(pixels, w, h, lut, lumaBase, gr, gg, gb, scene, noiseN)
+        if (scene != null && scene.skin != null) {
+            runCatching { skinSmoothPass(pixels, w, h, scene) }
+        }
+        sharpenPass(pixels, w, h, if (portrait) SHARPEN_PORTRAIT else SHARPEN_PHOTO, scene, noiseN)
 
         return Bitmap.createBitmap(pixels, w, h, Bitmap.Config.ARGB_8888)
     }
@@ -101,8 +114,13 @@ object PhotoEnhancer {
         lumaBase: LumaBase?,
         gr: Float,
         gg: Float,
-        gb: Float
+        gb: Float,
+        scene: SceneMap?,
+        noiseN: Float
     ) {
+        val localGain = LOCAL_GAIN * (1f - 0.5f * noiseN)
+        val sceneSx = if (scene != null) scene.w.toFloat() / w else 0f
+        val sceneSy = if (scene != null) scene.h.toFloat() / h else 0f
         val baseW = lumaBase?.w ?: 1
         val baseH = lumaBase?.h ?: 1
         val baseData = lumaBase?.data
@@ -116,9 +134,11 @@ object PhotoEnhancer {
             val y0 = by0.coerceIn(0, baseH - 1)
             val y1 = (by0 + 1).coerceIn(0, baseH - 1)
             val ty = (fy - by0).coerceIn(0f, 1f)
+            val sy = (y + 0.5f) * sceneSy - 0.5f
 
             for (x in 0 until w) {
                 val idx = row + x
+                val sx = (x + 0.5f) * sceneSx - 0.5f
                 val p = pixels[idx]
 
                 val r = (p shr 16) and 0xFF
@@ -146,21 +166,51 @@ object PhotoEnhancer {
                     val bot = baseData[r1 + x0] + tx * (baseData[r1 + x1] - baseData[r1 + x0])
                     val base = top + ty * (bot - top)
 
-                    val adj = (yNorm + LOCAL_GAIN * (yNorm - base)).coerceIn(0f, 1f)
+                    val adj = (yNorm + localGain * (yNorm - base)).coerceIn(0f, 1f)
                     lut[(adj * 255f + 0.5f).toInt()]
                 } else {
                     lut[(yNorm * 255f + 0.5f).toInt()]
                 }
 
-                // Vibrance + saturation around the new luma.
+                // Scene regions (0 when no scene map is available).
+                var skin = 0f
+                var person = 0f
+                var sky = 0f
+                var fol = 0f
+                var wat = 0f
+                var sun = 0f
+                var white = 0f
+                if (scene != null) {
+                    skin = scene.sample(scene.skin, sx, sy)
+                    person = scene.sample(scene.person, sx, sy)
+                    sky = scene.sample(scene.sky, sx, sy)
+                    fol = scene.sample(scene.foliage, sx, sy)
+                    wat = scene.sample(scene.water, sx, sy)
+                    sun = scene.sample(scene.sunset, sx, sy)
+                    white = scene.sample(scene.white, sx, sy)
+                }
+
+                // Region luminance: brighter skin, deeper sky/greens.
+                var yOut = outY.toFloat()
+                yOut += (255f - yOut) * (0.075f * skin + 0.02f * person)
+                yOut *= 1f - 0.07f * sky - 0.04f * fol
+
+                // Vibrance + saturation around the new luma. Chroma boost is
+                // damped in deep shadows so colour noise is not amplified.
                 val mx = max(r, max(g, b))
                 val mn = min(r, min(g, b))
                 val satPix = if (mx <= 0) 0f else (mx - mn) / mx.toFloat()
-                val chromaScale = 1f + SATURATION + VIBRANCE * (1f - satPix)
+                val dark = 0.35f + 0.65f * smoothStep(0.05f, 0.35f, yNorm)
+                var boost = (SATURATION + VIBRANCE * (1f - satPix)) * dark
+                boost += (0.38f * sky + 0.30f * fol + 0.20f * wat + 0.28f * sun) * dark
+                var chromaScale = 1f + boost
+                chromaScale *= 1f - 0.07f * skin
+                chromaScale += (0.92f - chromaScale) * white
+                chromaScale = chromaScale.coerceIn(0.6f, 2.1f)
 
-                val outR = outY + (rw - lumaW) * chromaScale
-                val outG = outY + (gw - lumaW) * chromaScale
-                val outB = outY + (bw - lumaW) * chromaScale
+                val outR = yOut + (rw - lumaW) * chromaScale + 2.5f * skin - 3f * fol
+                val outG = yOut + (gw - lumaW) * chromaScale + 5f * fol
+                val outB = yOut + (bw - lumaW) * chromaScale + 0.8f * skin
 
                 pixels[idx] = (0xFF shl 24) or
                     (outR.toInt().coerceIn(0, 255) shl 16) or
@@ -177,8 +227,18 @@ object PhotoEnhancer {
      * below is cached before any pixel is written, so no full-size extra
      * buffer is needed.
      */
-    private fun sharpenPass(pixels: IntArray, w: Int, h: Int, amount: Float) {
+    private fun sharpenPass(
+        pixels: IntArray,
+        w: Int,
+        h: Int,
+        amount: Float,
+        scene: SceneMap?,
+        noiseN: Float
+    ) {
         if (w < 3 || h < 3) return
+        val core = 1.2f + 3.5f * noiseN
+        val sceneSx = if (scene != null) scene.w.toFloat() / w else 0f
+        val sceneSy = if (scene != null) scene.h.toFloat() / h else 0f
 
         fun lumaInto(y: Int, out: ByteArray) {
             val row = y * w
@@ -199,6 +259,7 @@ object PhotoEnhancer {
         for (y in 0 until h) {
             val prevRow = if (y == 0) cur else prev
             val row = y * w
+            val sy = (y + 0.5f) * sceneSy - 0.5f
             for (x in 0 until w) {
                 val xm = if (x > 0) x - 1 else x
                 val xp = if (x < w - 1) x + 1 else x
@@ -207,7 +268,17 @@ object PhotoEnhancer {
                     (prevRow[x].toInt() and 0xFF) + (next[x].toInt() and 0xFF) +
                         (cur[xm].toInt() and 0xFF) + (cur[xp].toInt() and 0xFF)
                     ) * 0.25f
-                val delta = (center - avg) * amount
+                val d = center - avg
+                // Coring: tiny differences are noise, not detail -> not sharpened.
+                var amt = amount * smoothStep(core * 0.4f, core * 1.6f, abs(d))
+                if (scene != null) {
+                    val sx = (x + 0.5f) * sceneSx - 0.5f
+                    val edge = scene.sample(scene.edge, sx, sy)
+                    val skin = scene.sample(scene.skin, sx, sy)
+                    val fol = scene.sample(scene.foliage, sx, sy)
+                    amt *= (0.30f + 0.70f * edge) * (1f - 0.85f * skin) * (1f + 0.35f * fol)
+                }
+                val delta = d * amt
 
                 val p = pixels[row + x]
                 val r = (((p shr 16) and 0xFF) + delta).toInt().coerceIn(0, 255)
@@ -371,7 +442,15 @@ object PhotoEnhancer {
      * proxy, chroma smoothed harder than luma, then blended back into the
      * full-resolution frame by [mix].
      */
-    private fun denoiseGuided(px: IntArray, w: Int, h: Int, mix: Float, lift: Float, noiseN: Float) {
+    private fun denoiseGuided(
+        px: IntArray,
+        w: Int,
+        h: Int,
+        mix: Float,
+        lift: Float,
+        noiseN: Float,
+        scene: SceneMap?
+    ) {
         val scale = if (w.toLong() * h > DENOISE_MAX_PIXELS) {
             sqrt(DENOISE_MAX_PIXELS.toFloat() / (w.toFloat() * h))
         } else 1f
@@ -428,14 +507,98 @@ object PhotoEnhancer {
         den.getPixels(dp, 0, w, 0, 0, w, h)
         den.recycle()
 
-        val keep = 1f - mix
-        for (i in px.indices) {
-            val a = px[i]
-            val c = dp[i]
-            val ro = (((a shr 16) and 0xFF) * keep + ((c shr 16) and 0xFF) * mix + 0.5f).toInt()
-            val go = (((a shr 8) and 0xFF) * keep + ((c shr 8) and 0xFF) * mix + 0.5f).toInt()
-            val bo = ((a and 0xFF) * keep + (c and 0xFF) * mix + 0.5f).toInt()
-            px[i] = (0xFF shl 24) or (ro.coerceIn(0, 255) shl 16) or (go.coerceIn(0, 255) shl 8) or bo.coerceIn(0, 255)
+        // Per-pixel strength: flat areas (sky, skin, walls) and shadows are
+        // denoised harder than detailed/bright areas so texture survives.
+        val sceneSx = if (scene != null) scene.w.toFloat() / w else 0f
+        val sceneSy = if (scene != null) scene.h.toFloat() / h else 0f
+        for (yy in 0 until h) {
+            val sy = (yy + 0.5f) * sceneSy - 0.5f
+            for (xx in 0 until w) {
+                val i = yy * w + xx
+                val a = px[i]
+                val c = dp[i]
+                val edge = if (scene != null) {
+                    scene.sample(scene.edge, (xx + 0.5f) * sceneSx - 0.5f, sy)
+                } else 0.5f
+                val yA = (77 * ((a shr 16) and 0xFF) + 150 * ((a shr 8) and 0xFF) + 29 * (a and 0xFF)) shr 8
+                val dk = 1f - yA / 255f
+                val m = (mix * (1.2f - 0.7f * edge) * (1f + 0.6f * dk * dk)).coerceIn(0f, 0.95f)
+                val keep = 1f - m
+                val ro = (((a shr 16) and 0xFF) * keep + ((c shr 16) and 0xFF) * m + 0.5f).toInt()
+                val go = (((a shr 8) and 0xFF) * keep + ((c shr 8) and 0xFF) * m + 0.5f).toInt()
+                val bo = ((a and 0xFF) * keep + (c and 0xFF) * m + 0.5f).toInt()
+                px[i] = (0xFF shl 24) or (ro.coerceIn(0, 255) shl 16) or (go.coerceIn(0, 255) shl 8) or bo.coerceIn(0, 255)
+            }
+        }
+    }
+
+    /**
+     * Beauty pass: edge-preserving smoothing (guided filter) blended in only
+     * where skin was detected, so faces/body get smooth while eyes, hair,
+     * lips and the background keep their detail.
+     */
+    private fun skinSmoothPass(px: IntArray, w: Int, h: Int, scene: SceneMap) {
+        val skinMap = scene.skin ?: return
+        val scale = if (w.toLong() * h > SKIN_SMOOTH_MAX_PIXELS) {
+            sqrt(SKIN_SMOOTH_MAX_PIXELS.toFloat() / (w.toFloat() * h))
+        } else 1f
+        val sw = max(8, (w * scale).toInt())
+        val sh = max(8, (h * scale).toInt())
+
+        val full = Bitmap.createBitmap(px, w, h, Bitmap.Config.ARGB_8888)
+        val small = if (sw == w && sh == h) full else Bitmap.createScaledBitmap(full, sw, sh, true)
+        val sp = IntArray(sw * sh)
+        small.getPixels(sp, 0, sw, 0, 0, sw, sh)
+        if (small !== full) small.recycle()
+        full.recycle()
+
+        val n = sw * sh
+        val r = FloatArray(n); val g = FloatArray(n); val b = FloatArray(n); val y = FloatArray(n)
+        for (i in 0 until n) {
+            val p = sp[i]
+            r[i] = ((p shr 16) and 0xFF) / 255f
+            g[i] = ((p shr 8) and 0xFF) / 255f
+            b[i] = (p and 0xFF) / 255f
+            y[i] = 0.299f * r[i] + 0.587f * g[i] + 0.114f * b[i]
+        }
+        val rad = max(3, min(sw, sh) / 110)
+        val eps = 0.03f * 0.03f
+        val fr = MaskRefiner.guidedFilter(y, r, sw, sh, rad, eps)
+        val fg = MaskRefiner.guidedFilter(y, g, sw, sh, rad, eps)
+        val fb = MaskRefiner.guidedFilter(y, b, sw, sh, rad, eps)
+        val out = IntArray(n)
+        for (i in 0 until n) {
+            out[i] = (0xFF shl 24) or
+                ((fr[i] * 255f + 0.5f).toInt().coerceIn(0, 255) shl 16) or
+                ((fg[i] * 255f + 0.5f).toInt().coerceIn(0, 255) shl 8) or
+                (fb[i] * 255f + 0.5f).toInt().coerceIn(0, 255)
+        }
+        var sm = Bitmap.createBitmap(out, sw, sh, Bitmap.Config.ARGB_8888)
+        if (sw != w || sh != h) {
+            val up = Bitmap.createScaledBitmap(sm, w, h, true)
+            sm.recycle()
+            sm = up
+        }
+        val dp = IntArray(w * h)
+        sm.getPixels(dp, 0, w, 0, 0, w, h)
+        sm.recycle()
+
+        val sceneSx = scene.w.toFloat() / w
+        val sceneSy = scene.h.toFloat() / h
+        for (yy in 0 until h) {
+            val sy = (yy + 0.5f) * sceneSy - 0.5f
+            for (xx in 0 until w) {
+                val wgt = scene.sample(skinMap, (xx + 0.5f) * sceneSx - 0.5f, sy) * SKIN_SMOOTH
+                if (wgt < 0.01f) continue
+                val i = yy * w + xx
+                val a = px[i]
+                val c = dp[i]
+                val keep = 1f - wgt
+                val ro = (((a shr 16) and 0xFF) * keep + ((c shr 16) and 0xFF) * wgt + 0.5f).toInt()
+                val go = (((a shr 8) and 0xFF) * keep + ((c shr 8) and 0xFF) * wgt + 0.5f).toInt()
+                val bo = ((a and 0xFF) * keep + (c and 0xFF) * wgt + 0.5f).toInt()
+                px[i] = (0xFF shl 24) or (ro.coerceIn(0, 255) shl 16) or (go.coerceIn(0, 255) shl 8) or bo.coerceIn(0, 255)
+            }
         }
     }
 }

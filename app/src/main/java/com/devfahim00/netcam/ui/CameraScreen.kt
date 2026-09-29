@@ -777,7 +777,7 @@ fun CameraScreen() {
                     toSave = if (settings.autoEnhance) {
                         processingStage = context.getString(R.string.stage_enhance)
                         withContext(Dispatchers.Default) {
-                            PhotoEnhancer.enhance(prepared, portrait = false)
+                            PhotoEnhancer.enhanceSmart(prepared, portrait = false)
                         }
                     } else {
                         prepared
@@ -788,7 +788,7 @@ fun CameraScreen() {
                     toSave = if (settings.autoEnhance) {
                         processingStage = context.getString(R.string.stage_enhance)
                         withContext(Dispatchers.Default) {
-                            PhotoEnhancer.enhance(prepared, portrait = false)
+                            PhotoEnhancer.enhanceSmart(prepared, portrait = false)
                         }
                     } else {
                         prepared
@@ -799,7 +799,7 @@ fun CameraScreen() {
         } else if (settings.autoEnhance && modeSnap != CameraMode.PRO) {
             processingStage = context.getString(R.string.stage_enhance)
             toSave = withContext(Dispatchers.Default) {
-                PhotoEnhancer.enhance(prepared, portrait = false)
+                PhotoEnhancer.enhanceSmart(prepared, portrait = false)
             }
             processingStage = null
         } else {

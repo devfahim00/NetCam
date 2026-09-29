@@ -171,6 +171,20 @@ object SegmentationManager {
         null
     }
 
+    /**
+     * Person-only soft mask (bundled selfie model, works offline). Used by
+     * [SceneAnalyzer] to find people/skin in ordinary photos. Null when no
+     * person is found or the model fails.
+     */
+    suspend fun personMask(source: Bitmap): SoftMask? = withContext(Dispatchers.Default) {
+        val mask = runCatching {
+            withTimeoutOrNull(SELFIE_TIMEOUT_MS) { selfieMask(source) }
+        }.getOrNull() ?: return@withContext null
+        val alpha = personToFullSize(mask, source.width, source.height)
+        if (coverage(alpha) < 0.006f) null
+        else SoftMask(alpha, source.width, source.height, MaskEngine.SELFIE)
+    }
+
     // ---------------------------------------------------------------- engines
 
     private suspend fun subjectCutout(source: Bitmap): Bitmap? =
