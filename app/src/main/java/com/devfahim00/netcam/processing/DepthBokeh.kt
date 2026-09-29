@@ -40,7 +40,10 @@ object DepthBokeh {
     private const val MIN_SPAN = 0.18f        // min depth span mapped to full blur (avoids over-amplifying noise)
     private const val FOREGROUND_SOFT = 0.75f
     private const val BLOOM_THRESHOLD = 0.72f
-    private const val BLOOM_GAIN = 0.40f
+    private const val BLOOM_GAIN = 0.25f
+    private const val MAX_LIGHTS = 400          // strongest point lights rendered as discs
+    private const val MIN_DISC_R = 2.5f         // px (working size); smaller blur stays a plain soft glow
+    private const val DISC_OPACITY = 0.85f
     private const val SIGMA_FRAC = 0.0075f      // max blur sigma as a fraction of the long side (at strength 1.0)
     private const val COC_GAMMA = 1.45f         // >1: mid-distance objects stay recognisable, only the far scene melts
     private const val DETAIL_KEEP = 0.16f       // share of the original structure kept in the far background
@@ -135,6 +138,10 @@ object DepthBokeh {
         // Re-apply protection after filtering so blur can never creep into the subject.
         for (i in 0 until n) coc[i] = cocFiltered[i].coerceIn(0f, 1f) * (1f - region[i]) * maxCoc
 
+        // ---- 3b) point lights -> real bokeh discs ---------------------------
+        val lights = runCatching { detectLights(gray, chR, chG, chB, coc, w, h, side) }.getOrNull()
+        Log.d(TAG, "bokehLights=${lights?.lights?.size ?: 0}")
+
         // ---- 4) blur level per pixel -------------------------------------
         val radii = FloatArray(RADII.size) { RADII[it] * maxCoc }
         val top = radii.size - 1
@@ -163,6 +170,10 @@ object DepthBokeh {
         }
 
         if (maxNeeded >= 1) {
+            // Lights that become discs are removed from the gaussian layers so
+            // they do not leave a muddy glow underneath the disc.
+            lights?.let { suppressLights(it, chR, chG, chB, w, h, side) }
+
             // Bloom: only genuine light *peaks* (bright AND much brighter than
             // their surroundings) are pushed up, so lights become discs while
             // large bright areas (walls, sky, curtains) are NOT blown out.
@@ -277,6 +288,9 @@ object DepthBokeh {
             }
         }
 
+        // ---- lens-style bokeh discs ---------------------------------------
+        lights?.let { drawLights(it, coc, w, h, outR, outG, outB) }
+
         // ---- 6) composite onto the full-resolution photo -------------------
         val outPixels = IntArray(n)
         for (i in 0 until n) {
@@ -319,6 +333,171 @@ object DepthBokeh {
     private fun runParallel(count: Int, task: (Int) -> Unit) {
         val futures = (0 until count).map { c -> pool.submit(Runnable { task(c) }) }
         futures.forEach { it.get() }
+    }
+
+
+    // ------------------------------------------------------- bokeh discs
+
+    private class Light(
+        val cx: Float, val cy: Float, val r: Float, val cocL: Float,
+        val red: Float, val green: Float, val blue: Float, val a: Float,
+        val segStart: Int, val segEnd: Int
+    )
+
+    private class LightSet(val lights: List<Light>, val mask: FloatArray, val queue: IntArray)
+
+    /**
+     * Finds small, bright, isolated light sources sitting in blurred areas
+     * (street lamps, fairy lights, reflections) via connected components.
+     * Big bright areas (windows, sky, walls) are ignored so they are not
+     * turned into giant discs.
+     */
+    private fun detectLights(
+        gray: FloatArray, chR: FloatArray, chG: FloatArray, chB: FloatArray,
+        coc: FloatArray, w: Int, h: Int, side: Int
+    ): LightSet? {
+        val n = w * h
+        val localMean = MaskRefiner.boxFilter(gray, w, h, max(6, side / 30))
+        val cand = BooleanArray(n)
+        val score = FloatArray(n)
+        var any = false
+        for (i in 0 until n) {
+            if (coc[i] <= 2f) continue
+            val lum = gray[i]
+            val sc = smoothstep(0.08f, 0.25f, lum - localMean[i]) * smoothstep(0.55f, 0.85f, lum)
+            if (sc > 0.25f) { cand[i] = true; score[i] = sc; any = true }
+        }
+        if (!any) return null
+
+        val maxArea = max(12, (0.0035f * n).toInt())
+        val visited = BooleanArray(n)
+        val queue = IntArray(n)
+        var qt = 0
+        val found = ArrayList<Light>()
+        val cocMean = FloatArray(1)
+        for (start in 0 until n) {
+            if (!cand[start] || visited[start]) continue
+            val segStart = qt
+            visited[start] = true
+            queue[qt++] = start
+            var head = segStart
+            var sx = 0.0; var sy = 0.0
+            var sr = 0.0; var sg = 0.0; var sb = 0.0
+            var ss = 0.0; var sc = 0.0
+            while (head < qt) {
+                val i = queue[head++]
+                val x = i % w
+                val y = i / w
+                sx += x; sy += y
+                sr += chR[i]; sg += chG[i]; sb += chB[i]
+                ss += score[i]; sc += coc[i]
+                if (x > 0 && cand[i - 1] && !visited[i - 1]) { visited[i - 1] = true; queue[qt++] = i - 1 }
+                if (x < w - 1 && cand[i + 1] && !visited[i + 1]) { visited[i + 1] = true; queue[qt++] = i + 1 }
+                if (y > 0 && cand[i - w] && !visited[i - w]) { visited[i - w] = true; queue[qt++] = i - w }
+                if (y < h - 1 && cand[i + w] && !visited[i + w]) { visited[i + w] = true; queue[qt++] = i + w }
+            }
+            val area = qt - segStart
+            if (area < 2 || area > maxArea) { qt = segStart; continue }
+            cocMean[0] = (sc / area).toFloat()
+            val blobR = kotlin.math.sqrt(area / Math.PI.toFloat())
+            val r = min(1.2f * cocMean[0] + 0.5f * blobR, 0.06f * side)
+            if (r < MIN_DISC_R) { qt = segStart; continue }
+
+            // colour: mean of the core, chroma pushed a little, normalised bright
+            var cr = (sr / area).toFloat(); var cg = (sg / area).toFloat(); var cb = (sb / area).toFloat()
+            val yy = 0.299f * cr + 0.587f * cg + 0.114f * cb
+            cr = (yy + (cr - yy) * 1.3f).coerceIn(0f, 255f)
+            cg = (yy + (cg - yy) * 1.3f).coerceIn(0f, 255f)
+            cb = (yy + (cb - yy) * 1.3f).coerceIn(0f, 255f)
+            val m = max(cr, max(cg, cb))
+            if (m > 1f) { val k = 235f / m; cr *= k; cg *= k; cb *= k }
+
+            val meanScore = (ss / area).toFloat()
+            val sizeGain = (0.55f + 0.15f * kotlin.math.sqrt(area.toFloat())).coerceAtMost(1f)
+            val a = DISC_OPACITY * sizeGain * (0.6f + 0.4f * meanScore)
+            found.add(
+                Light(
+                    (sx / area).toFloat() + 0.5f, (sy / area).toFloat() + 0.5f, r, cocMean[0],
+                    cr, cg, cb, a, segStart, qt
+                )
+            )
+        }
+        if (found.isEmpty()) return null
+        found.sortByDescending { it.a * (it.segEnd - it.segStart) }
+        val top = if (found.size > MAX_LIGHTS) found.subList(0, MAX_LIGHTS).toList() else found.toList()
+        val mask = FloatArray(n)
+        for (l in top) for (j in l.segStart until l.segEnd) mask[queue[j]] = 1f
+        return LightSet(top, mask, queue)
+    }
+
+    /** Replaces the light pixels by the surrounding colour before the gaussian layers run. */
+    private fun suppressLights(
+        set: LightSet, chR: FloatArray, chG: FloatArray, chB: FloatArray,
+        w: Int, h: Int, side: Int
+    ) {
+        val n = w * h
+        val keep = FloatArray(n) { 1f - set.mask[it] }
+        val near = MaskRefiner.boxFilter(set.mask, w, h, 2)
+        val r = max(6, side / 30)
+        val den = MaskRefiner.boxFilter(keep, w, h, r)
+        for (ch in arrayOf(chR, chG, chB)) {
+            val num = MaskRefiner.boxFilter(FloatArray(n) { ch[it] * keep[it] }, w, h, r)
+            for (i in 0 until n) {
+                val m = min(1f, near[i] * 3f)
+                if (m <= 0f) continue
+                val repl = if (den[i] > 0.05f) num[i] / den[i] else ch[i]
+                ch[i] = ch[i] * (1f - m) + repl * m
+            }
+        }
+    }
+
+    /**
+     * Paints each light as a disc (soft body, slightly brighter rim like a
+     * real lens), screen-blended so overlapping discs add up. Pixels that are
+     * nearer/sharper than the light occlude it, so discs never cover the subject.
+     */
+    private fun drawLights(
+        set: LightSet, coc: FloatArray, w: Int, h: Int,
+        outR: FloatArray, outG: FloatArray, outB: FloatArray
+    ) {
+        val n = w * h
+        val accR = FloatArray(n)
+        val accG = FloatArray(n)
+        val accB = FloatArray(n)
+        for (l in set.lights) {
+            val r = l.r
+            val x0 = max(0, (l.cx - r - 1f).toInt())
+            val x1 = min(w - 1, (l.cx + r + 1f).toInt())
+            val y0 = max(0, (l.cy - r - 1f).toInt())
+            val y1 = min(h - 1, (l.cy + r + 1f).toInt())
+            for (y in y0..y1) {
+                val dy = y + 0.5f - l.cy
+                val row = y * w
+                for (x in x0..x1) {
+                    val dx = x + 0.5f - l.cx
+                    val d = kotlin.math.sqrt(dx * dx + dy * dy)
+                    if (d > r + 1f) continue
+                    val edge = ((r - d) / 1.2f + 0.5f).coerceIn(0f, 1f)
+                    if (edge <= 0f) continue
+                    val i = row + x
+                    val body = 0.72f + 0.38f * smoothstep(0.55f, 0.97f, d / r)
+                    val occ = smoothstep(0.25f * l.cocL, 0.6f * l.cocL, coc[i])
+                    val v = l.a * body * edge * occ
+                    if (v > 0f) {
+                        accR[i] += l.red * v
+                        accG[i] += l.green * v
+                        accB[i] += l.blue * v
+                    }
+                }
+            }
+        }
+        for (i in 0 until n) {
+            val lr = accR[i]; val lg = accG[i]; val lb = accB[i]
+            if (lr <= 0f && lg <= 0f && lb <= 0f) continue
+            outR[i] = 255f - (255f - outR[i]) * (255f - lr.coerceIn(0f, 255f)) / 255f
+            outG[i] = 255f - (255f - outG[i]) * (255f - lg.coerceIn(0f, 255f)) / 255f
+            outB[i] = 255f - (255f - outB[i]) * (255f - lb.coerceIn(0f, 255f)) / 255f
+        }
     }
 
     /** cur = num/den where den is trustworthy, else the previous (less blurry) level. */
