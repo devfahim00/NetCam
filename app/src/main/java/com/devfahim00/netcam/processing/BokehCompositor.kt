@@ -1,6 +1,7 @@
 package com.devfahim00.netcam.processing
 
 import android.graphics.Bitmap
+import kotlin.math.min
 import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.PorterDuff
@@ -55,10 +56,10 @@ object BokehCompositor {
         // blur from a GCam-grade one.
         val bgHalf = Bitmap.createScaledBitmap(base, halfW, halfH, true)
         val bgHalfBloom = boostHighlights(bgHalf)
-        val s = 0.45f + 0.85f * strength
-        val l1 = smoothBlur(bgHalfBloom, 2.6f * s, 64)
-        val l2 = smoothBlur(bgHalfBloom, 6.0f * s, 40)
-        val l3 = smoothBlur(bgHalfBloom, 11.5f * s, 26)
+        val s = 0.30f + 0.45f * min(strength, 1.25f)
+        val l1 = smoothBlur(bgHalfBloom, 2.2f * s, 96)
+        val l2 = smoothBlur(bgHalfBloom, 4.5f * s, 72)
+        val l3 = smoothBlur(bgHalfBloom, 7.5f * s, 56)
 
         val p1 = IntArray(halfW * halfH)
         val p2 = IntArray(halfW * halfH)

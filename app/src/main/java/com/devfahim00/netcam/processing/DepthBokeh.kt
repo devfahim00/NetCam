@@ -34,13 +34,16 @@ import kotlin.math.roundToInt
  */
 object DepthBokeh {
 
-    private val RADII = floatArrayOf(0f, 2.5f, 5f, 8.5f, 13f, 19f, 27f)
+    private val RADII = floatArrayOf(0f, 0.12f, 0.27f, 0.47f, 0.72f, 0.90f, 1.0f)  // fractions of maxCoc
     private const val TAG = "DepthBokeh"
     private const val BAND_PAD = 0.05f        // extra in-focus slack around the subject's own depth range
     private const val MIN_SPAN = 0.18f        // min depth span mapped to full blur (avoids over-amplifying noise)
     private const val FOREGROUND_SOFT = 0.75f
     private const val BLOOM_THRESHOLD = 0.72f
     private const val BLOOM_GAIN = 0.40f
+    private const val SIGMA_FRAC = 0.0075f      // max blur sigma as a fraction of the long side (at strength 1.0)
+    private const val COC_GAMMA = 1.45f         // >1: mid-distance objects stay recognisable, only the far scene melts
+    private const val DETAIL_KEEP = 0.16f       // share of the original structure kept in the far background
 
     /**
      * @param base full-resolution photo.
@@ -111,15 +114,18 @@ object DepthBokeh {
         Log.d(TAG, "focus=$focus band=[$bandLo,$bandHi] bgRef=$bgRef fgRef=$fgRef " +
             "maskCov=${cov(mask)} filledCov=${cov(filled)} regionCov=${cov(region)}")
 
-        val maxCoc = 17f * strength * sScale
+        // Slider above 1.0 grows at half speed so the background never turns into mush.
+        val effStrength = if (strength <= 1f) strength else 1f + (strength - 1f) * 0.5f
+        // box radius ~ sigma, coc is expressed in "sigma * 1.6" units (see boxR below)
+        val maxCoc = 1.6f * side * SIGMA_FRAC * effStrength
         val coc01 = FloatArray(n)
         for (i in 0 until n) {
             val d = depth[i]
             var c = 0f
             if (d < bandLo) {
-                c = ((bandLo - d) / farSpan).coerceIn(0f, 1f)
+                c = ((bandLo - d) / farSpan).coerceIn(0f, 1f).pow(COC_GAMMA)
             } else if (d > bandHi) {
-                c = ((d - bandHi) / nearSpan).coerceIn(0f, 1f) * FOREGROUND_SOFT
+                c = ((d - bandHi) / nearSpan).coerceIn(0f, 1f).pow(COC_GAMMA) * FOREGROUND_SOFT
             }
             // The whole subject region is protected -> never blurred inside.
             coc01[i] = c * (1f - region[i])
@@ -130,7 +136,7 @@ object DepthBokeh {
         for (i in 0 until n) coc[i] = cocFiltered[i].coerceIn(0f, 1f) * (1f - region[i]) * maxCoc
 
         // ---- 4) blur level per pixel -------------------------------------
-        val radii = FloatArray(RADII.size) { RADII[it] * strength * sScale }
+        val radii = FloatArray(RADII.size) { RADII[it] * maxCoc }
         val top = radii.size - 1
         val lvl = FloatArray(n)
         var maxNeeded = 0
@@ -256,6 +262,21 @@ object DepthBokeh {
                         outR[i] *= g; outG[i] *= g; outB[i] *= g
                     }
                 }
+            }
+        }
+
+        // ---- detail retention ---------------------------------------------
+        // A real lens still shows *what* is behind the subject (trees, shelves,
+        // people as soft shapes). Fold a little of the original structure back
+        // into the blurred areas, strongest where blur is strongest.
+        for (i in 0 until n) {
+            val t = (coc[i] / max(maxCoc, 1e-3f)).coerceIn(0f, 1f)
+            val k = DETAIL_KEEP * smoothstep(0.05f, 0.6f, t) * (1f - 0.35f * t)
+            if (k > 0f) {
+                val p = px[i]
+                outR[i] += (((p shr 16) and 0xFF) - outR[i]) * k
+                outG[i] += (((p shr 8) and 0xFF) - outG[i]) * k
+                outB[i] += ((p and 0xFF) - outB[i]) * k
             }
         }
 
