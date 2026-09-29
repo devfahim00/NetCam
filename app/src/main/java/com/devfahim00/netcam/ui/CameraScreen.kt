@@ -72,7 +72,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
@@ -227,6 +229,8 @@ fun CameraScreen() {
     var lastThumbnail by remember { mutableStateOf<ImageBitmap?>(null) }
     var lastUri by remember { mutableStateOf<Uri?>(null) }
     var focusTarget by remember { mutableStateOf<FocusTarget?>(null) }
+    // Where the (ratio-exact) preview sits inside the full-screen layout, in px.
+    var previewRect by remember { mutableStateOf(Rect.Zero) }
     var toastRes by remember { mutableStateOf<Int?>(null) }
     var showSettings by remember { mutableStateOf(false) }
     var showQuickSettings by rememberSaveable { mutableStateOf(false) }
@@ -935,6 +939,8 @@ fun CameraScreen() {
     fun focusAt(offset: Offset, lock: Boolean) {
         val cam = camera ?: return
         if (mfEnabled) return
+        val pr = previewRect
+        if (pr.width > 0f && !pr.contains(offset)) return
         if (lock) haptic.performHapticFeedback(HapticFeedbackType.LongPress)
         aeLocked = lock
         val id = System.nanoTime()
@@ -943,7 +949,7 @@ fun CameraScreen() {
         evTarget = offset
         evLastInteraction = SystemClock.uptimeMillis()
 
-        val point = previewView.meteringPointFactory.createPoint(offset.x, offset.y)
+        val point = previewView.meteringPointFactory.createPoint(offset.x - pr.left, offset.y - pr.top)
         val builder = FocusMeteringAction.Builder(point)
         if (lock) builder.disableAutoCancel() else builder.setAutoCancelDuration(4, TimeUnit.SECONDS)
         val future = runCatching {
@@ -1014,9 +1020,28 @@ fun CameraScreen() {
             .fillMaxSize()
             .background(Color.Black)
     ) {
-        // Camera preview + gestures
+        // Preview is sized to the exact capture ratio (4:3 or 16:9) so what
+        // you see is what gets saved; the rest of the screen stays black.
+        val ratio = if (settings.aspect == AspectRatioOption.R16_9) 16f / 9f else 4f / 3f
+        val density = LocalDensity.current
+        val maxWpx = with(density) { maxWidth.toPx() }
+        val maxHpx = with(density) { maxHeight.toPx() }
+        val pw = min(maxWpx, maxHpx / ratio)
+        val ph = pw * ratio
+        val pl = (maxWpx - pw) / 2f
+        val pt = (maxHpx - ph) / 2f
+        LaunchedEffect(pl, pt, pw, ph) { previewRect = Rect(pl, pt, pl + pw, pt + ph) }
+        val previewMod = Modifier
+            .align(Alignment.Center)
+            .size(with(density) { pw.toDp() }, with(density) { ph.toDp() })
+
         AndroidView(
             factory = { previewView },
+            modifier = previewMod
+        )
+
+        // Gesture layer (full screen; taps on the black bars are ignored in focusAt)
+        Box(
             modifier = Modifier
                 .fillMaxSize()
                 .pointerInput(Unit) {
@@ -1065,7 +1090,7 @@ fun CameraScreen() {
         // 1:1 framing guide (preview is letterboxed to 4:3, so this square
         // matches the exact capture area).
         if (settings.aspect == AspectRatioOption.SQUARE) {
-            Canvas(Modifier.fillMaxSize()) {
+            Canvas(previewMod) {
                 val side = min(size.width, size.height)
                 val left = (size.width - side) / 2f
                 val top = (size.height - side) / 2f
@@ -1101,7 +1126,8 @@ fun CameraScreen() {
 
         GridOverlay(
             option = settings.grid,
-            squareOnly = settings.aspect == AspectRatioOption.SQUARE
+            squareOnly = settings.aspect == AspectRatioOption.SQUARE,
+            modifier = previewMod
         )
         if (settings.level) {
             tilt?.let { LevelIndicator(tiltDegrees = it) }

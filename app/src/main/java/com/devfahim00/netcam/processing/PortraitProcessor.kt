@@ -30,7 +30,7 @@ sealed class PortraitResult {
  */
 object PortraitProcessor {
 
-    private const val WORKING_SIDE = 1024
+    private const val WORKING_SIDE = 800
 
     /**
      * @param source decoded, upright capture (any size).

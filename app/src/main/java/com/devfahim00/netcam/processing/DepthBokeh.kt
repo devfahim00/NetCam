@@ -179,64 +179,61 @@ object DepthBokeh {
                 }
             }
 
-            val blurrer = Blurrer(w, h)
-            var prevR = FloatArray(n)
-            var prevG = FloatArray(n)
-            var prevB = FloatArray(n)
+            // R, G, B (and the coverage plane) are independent, so each level's
+            // blurs run on separate cores — same result, ~2-3x faster.
+            val chans = arrayOf(chR, chG, chB)
+            val blurrers = Array(4) { Blurrer(w, h) }
+            val tmps = Array(3) { FloatArray(n) }
+            val srcTmps = Array(3) { FloatArray(n) }
+            var prev = Array(3) { FloatArray(n) }
+            var cur = Array(3) { FloatArray(n) }
             for (i in 0 until n) {
                 // L0 (sharp) approximated by the bloom-free original.
                 val p = px[i]
-                prevR[i] = ((p shr 16) and 0xFF).toFloat()
-                prevG[i] = ((p shr 8) and 0xFF).toFloat()
-                prevB[i] = (p and 0xFF).toFloat()
+                prev[0][i] = ((p shr 16) and 0xFF).toFloat()
+                prev[1][i] = ((p shr 8) and 0xFF).toFloat()
+                prev[2][i] = (p and 0xFF).toFloat()
             }
-            var curR = FloatArray(n)
-            var curG = FloatArray(n)
-            var curB = FloatArray(n)
             val wk = FloatArray(n)
             val den = FloatArray(n)
-            val tmp = FloatArray(n)
-            val srcTmp = FloatArray(n)
 
             for (k in 1..maxNeeded) {
                 val boxR = max(1, (radii[k] / 1.6f).roundToInt())
                 val thr = if (k > 1) 0.85f * radii[k - 1] else 0f
 
                 if (k == 1) {
-                    blurrer.blur(chR, curR, boxR)
-                    blurrer.blur(chG, curG, boxR)
-                    blurrer.blur(chB, curB, boxR)
+                    val c0 = cur
+                    runParallel(3) { c -> blurrers[c].blur(chans[c], c0[c], boxR) }
                 } else {
                     // Only pixels at least as blurry as the previous level
                     // may contribute: sharp pixels never bleed into blur.
                     for (i in 0 until n) wk[i] = if (coc[i] >= thr) 1f else 0f
-                    blurrer.blur(wk, den, boxR)
-
-                    for (i in 0 until n) srcTmp[i] = chR[i] * wk[i]
-                    blurrer.blur(srcTmp, tmp, boxR)
-                    mixLayer(curR, tmp, den, prevR, n)
-
-                    for (i in 0 until n) srcTmp[i] = chG[i] * wk[i]
-                    blurrer.blur(srcTmp, tmp, boxR)
-                    mixLayer(curG, tmp, den, prevG, n)
-
-                    for (i in 0 until n) srcTmp[i] = chB[i] * wk[i]
-                    blurrer.blur(srcTmp, tmp, boxR)
-                    mixLayer(curB, tmp, den, prevB, n)
+                    runParallel(4) { c ->
+                        if (c == 3) {
+                            blurrers[3].blur(wk, den, boxR)
+                        } else {
+                            val src = chans[c]
+                            val st = srcTmps[c]
+                            for (i in 0 until n) st[i] = src[i] * wk[i]
+                            blurrers[c].blur(st, tmps[c], boxR)
+                        }
+                    }
+                    val c0 = cur
+                    val p0 = prev
+                    runParallel(3) { c -> mixLayer(c0[c], tmps[c], den, p0[c], n) }
                 }
 
+                val cR = cur[0]; val cG = cur[1]; val cB = cur[2]
                 for (i in 0 until n) {
                     val wl = 1f - abs(lvl[i] - k)
                     if (wl > 0f) {
-                        outR[i] += curR[i] * wl
-                        outG[i] += curG[i] * wl
-                        outB[i] += curB[i] * wl
+                        outR[i] += cR[i] * wl
+                        outG[i] += cG[i] * wl
+                        outB[i] += cB[i] * wl
                     }
                 }
 
-                val sR = prevR; prevR = curR; curR = sR
-                val sG = prevG; prevG = curG; curG = sG
-                val sB = prevB; prevB = curB; curB = sB
+                val swap = prev; prev = cur; cur = swap
             }
         }
 
@@ -312,6 +309,17 @@ object DepthBokeh {
     }
 
     // ------------------------------------------------------------ internals
+
+    private val pool: java.util.concurrent.ExecutorService =
+        java.util.concurrent.Executors.newFixedThreadPool(4) { r ->
+            Thread(r, "bokeh-worker").apply { isDaemon = true }
+        }
+
+    /** Runs task(0..count-1) concurrently and waits for all of them. */
+    private fun runParallel(count: Int, task: (Int) -> Unit) {
+        val futures = (0 until count).map { c -> pool.submit(Runnable { task(c) }) }
+        futures.forEach { it.get() }
+    }
 
     /** cur = num/den where den is trustworthy, else the previous (less blurry) level. */
     private fun mixLayer(cur: FloatArray, num: FloatArray, den: FloatArray, prev: FloatArray, n: Int) {
