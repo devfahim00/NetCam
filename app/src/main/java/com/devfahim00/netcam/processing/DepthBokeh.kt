@@ -40,7 +40,7 @@ object DepthBokeh {
     private const val MIN_SPAN = 0.18f        // min depth span mapped to full blur (avoids over-amplifying noise)
     private const val FOREGROUND_SOFT = 0.75f
     private const val BLOOM_THRESHOLD = 0.72f
-    private const val BLOOM_GAIN = 0.45f
+    private const val BLOOM_GAIN = 0.40f
 
     /**
      * @param base full-resolution photo.
@@ -157,11 +157,16 @@ object DepthBokeh {
         }
 
         if (maxNeeded >= 1) {
-            // Bloom: push highlights up before blurring so lights become discs.
+            // Bloom: only genuine light *peaks* (bright AND much brighter than
+            // their surroundings) are pushed up, so lights become discs while
+            // large bright areas (walls, sky, curtains) are NOT blown out.
+            val localMean = MaskRefiner.boxFilter(gray, w, h, max(6, side / 30))
             for (i in 0 until n) {
                 val lum = gray[i]
-                if (lum > BLOOM_THRESHOLD) {
-                    val boost = 1f + (lum - BLOOM_THRESHOLD) / (1f - BLOOM_THRESHOLD) * BLOOM_GAIN
+                val peak = smoothstep(0.10f, 0.30f, lum - localMean[i]) *
+                    smoothstep(0.70f, 0.93f, lum)
+                if (peak > 0f) {
+                    val boost = 1f + peak * BLOOM_GAIN
                     chR[i] *= boost
                     chG[i] *= boost
                     chB[i] *= boost
@@ -226,6 +231,31 @@ object DepthBokeh {
                 val sR = prevR; prevR = curR; curR = sR
                 val sG = prevG; prevG = curG; curG = sG
                 val sB = prevB; prevB = curB; curB = sB
+            }
+        }
+
+        // ---- exposure guard ------------------------------------------------
+        // Blurring must never brighten the photo: match the mean luma of the
+        // blurred region to the original (small bloom allowance only).
+        run {
+            var sumIn = 0.0
+            var sumOut = 0.0
+            for (i in 0 until n) {
+                val wgt = lvl[i].coerceIn(0f, 1f)
+                if (wgt <= 0f) continue
+                sumIn += wgt * (0.299 * ((px[i] shr 16) and 0xFF) + 0.587 * ((px[i] shr 8) and 0xFF) + 0.114 * (px[i] and 0xFF))
+                sumOut += wgt * (0.299 * outR[i] + 0.587 * outG[i] + 0.114 * outB[i])
+            }
+            if (sumOut > 1e-3) {
+                val gain = (sumIn * 1.02 / sumOut).toFloat().coerceIn(0.70f, 1f)
+                Log.d(TAG, "exposureGuard gain=$gain")
+                if (gain < 0.999f) {
+                    for (i in 0 until n) {
+                        val wgt = lvl[i].coerceIn(0f, 1f)
+                        val g = 1f + (gain - 1f) * wgt
+                        outR[i] *= g; outG[i] *= g; outB[i] *= g
+                    }
+                }
             }
         }
 

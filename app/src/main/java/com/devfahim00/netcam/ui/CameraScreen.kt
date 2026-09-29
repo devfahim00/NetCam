@@ -142,7 +142,7 @@ import com.devfahim00.netcam.ui.components.ZoomChip
 import com.devfahim00.netcam.ui.components.focusDistanceLabel
 import com.devfahim00.netcam.ui.theme.Accent
 import com.devfahim00.netcam.util.await
-import com.devfahim00.netcam.util.centerThumbnail
+import com.devfahim00.netcam.util.fitThumbnail
 import com.devfahim00.netcam.util.cropCenterSquare
 import com.devfahim00.netcam.util.decodeJpegBytesCapped
 import com.devfahim00.netcam.util.mirrorHorizontal
@@ -154,6 +154,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import java.util.concurrent.Executors
@@ -220,6 +221,9 @@ fun CameraScreen() {
     var zoomRatio by remember { mutableStateOf(1f) }
     var isProcessing by remember { mutableStateOf(false) }
     var processingStage by remember { mutableStateOf<String?>(null) }
+    // Photos still being processed/saved in the background (no on-screen overlay).
+    var pendingSaves by remember { mutableStateOf(0) }
+    val processLock = remember { kotlinx.coroutines.sync.Mutex() }
     var lastThumbnail by remember { mutableStateOf<ImageBitmap?>(null) }
     var lastUri by remember { mutableStateOf<Uri?>(null) }
     var focusTarget by remember { mutableStateOf<FocusTarget?>(null) }
@@ -734,8 +738,13 @@ fun CameraScreen() {
     }
 
     /** Crop / mirror / portrait / enhance / save. */
-    suspend fun processAndSave(captured: Bitmap) {
-        val portrait = mode == CameraMode.PORTRAIT
+    suspend fun processAndSave(
+        captured: Bitmap,
+        modeSnap: CameraMode,
+        frontSnap: Boolean,
+        bokehSnap: Float
+    ) {
+        val portrait = modeSnap == CameraMode.PORTRAIT
         var toSave: Bitmap
         var messageRes = R.string.saved_to_gallery
 
@@ -744,7 +753,7 @@ fun CameraScreen() {
             if (settings.aspect == AspectRatioOption.SQUARE) {
                 bmp = bmp.cropCenterSquare()
             }
-            if (lensFacing == CameraSelector.LENS_FACING_FRONT && settings.mirrorFront) {
+            if (frontSnap && settings.mirrorFront) {
                 bmp = bmp.mirrorHorizontal()
             }
             bmp
@@ -754,7 +763,7 @@ fun CameraScreen() {
             processingStage = context.getString(R.string.stage_detect)
             when (val result = PortraitProcessor.process(
                 prepared,
-                bokehLocal * 1.5f,
+                bokehSnap * 1.5f,
                 settings.autoEnhance
             ) { stage ->
                 withContext(Dispatchers.Main) { processingStage = stageText(stage) }
@@ -787,7 +796,7 @@ fun CameraScreen() {
                 }
             }
             processingStage = null
-        } else if (settings.autoEnhance && mode != CameraMode.PRO) {
+        } else if (settings.autoEnhance && modeSnap != CameraMode.PRO) {
             processingStage = context.getString(R.string.stage_enhance)
             toSave = withContext(Dispatchers.Default) {
                 PhotoEnhancer.enhance(prepared, portrait = false)
@@ -801,16 +810,14 @@ fun CameraScreen() {
             ImageSaver.saveBitmap(context, toSave, settings.quality.jpegQuality)
         }
         if (uri == null) {
-            isProcessing = false
             toastRes = R.string.save_failed
             return
         }
 
         lastUri = uri
         lastThumbnail = withContext(Dispatchers.Default) {
-            toSave.centerThumbnail(360).asImageBitmap()
+            toSave.fitThumbnail(320).asImageBitmap()
         }
-        isProcessing = false
         toastRes = messageRes
     }
 
@@ -834,6 +841,7 @@ fun CameraScreen() {
         val cam = camera
         val hdrPossible = settings.hdr &&
             mode != CameraMode.PRO &&
+            mode != CameraMode.PORTRAIT &&
             flashMode == FlashMode.OFF &&
             cam != null &&
             runCatching {
@@ -900,12 +908,25 @@ fun CameraScreen() {
                 return@launch
             }
 
-            try {
-                processAndSave(captured!!)
-            } catch (t: Throwable) {
-                isProcessing = false
-                processingStage = null
-                toastRes = R.string.capture_failed
+            // Shutter is free again as soon as the frames are captured; the
+            // heavy work (portrait / enhance / save) continues in background.
+            val shot = captured!!
+            val modeSnap = mode
+            val frontSnap = lensFacing == CameraSelector.LENS_FACING_FRONT
+            val bokehSnap = bokehLocal
+            isProcessing = false
+            processingStage = null
+            pendingSaves++
+            scope.launch {
+                try {
+                    processLock.withLock {
+                        processAndSave(shot, modeSnap, frontSnap, bokehSnap)
+                    }
+                } catch (t: Throwable) {
+                    toastRes = R.string.capture_failed
+                } finally {
+                    pendingSaves--
+                }
             }
         }
     }
@@ -1381,6 +1402,7 @@ fun CameraScreen() {
                 ) {
                     GalleryButton(
                         thumbnail = lastThumbnail,
+                        busy = pendingSaves > 0,
                         onClick = { context.openGallery(lastUri) }
                     )
                 }
@@ -1415,52 +1437,6 @@ fun CameraScreen() {
                             contentDescription = stringResource(R.string.cd_switch_camera),
                             tint = Color.White,
                             modifier = Modifier.size(24.dp)
-                        )
-                    }
-                }
-            }
-        }
-
-        // ----- processing overlay -----
-        AnimatedVisibility(
-            visible = isProcessing && (mode == CameraMode.PORTRAIT || processingStage != null),
-            enter = fadeIn(tween(150)),
-            exit = fadeOut(tween(150))
-        ) {
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(Color.Black.copy(alpha = 0.45f))
-                    .clickable(
-                        interactionSource = remember { MutableInteractionSource() },
-                        indication = null,
-                        onClick = {}
-                    ),
-                contentAlignment = Alignment.Center
-            ) {
-                GlassSurface(
-                    shape = RoundedCornerShape(28.dp),
-                    contentPadding = 28.dp
-                ) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        CircularProgressIndicator(
-                            color = Accent,
-                            strokeWidth = 3.dp,
-                            modifier = Modifier.size(40.dp)
-                        )
-                        Spacer(Modifier.height(16.dp))
-                        Text(
-                            text = processingStage
-                                ?: stringResource(R.string.processing_portrait),
-                            color = Color.White,
-                            fontSize = 15.sp,
-                            fontWeight = FontWeight.SemiBold
-                        )
-                        Spacer(Modifier.height(6.dp))
-                        Text(
-                            text = stringResource(R.string.processing_subtitle),
-                            color = Color.White.copy(alpha = 0.6f),
-                            fontSize = 12.sp
                         )
                     }
                 }

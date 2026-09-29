@@ -1,10 +1,13 @@
 package com.devfahim00.netcam.processing
 
 import android.graphics.Bitmap
-import com.devfahim00.netcam.util.bitmapToGrayFloat
-import com.devfahim00.netcam.util.fastBlur
+import android.util.Log
+import kotlin.math.abs
+import kotlin.math.ln
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.pow
+import kotlin.math.sqrt
 
 /**
  * "Social-ready" color pipeline applied to every capture — the look that
@@ -31,6 +34,13 @@ object PhotoEnhancer {
     private const val SHARPEN_PHOTO = 0.30f
     private const val SHARPEN_PORTRAIT = 0.20f
 
+    private const val TAG = "PhotoEnhancer"
+    /** Median luma dark/underexposed shots are lifted toward. */
+    private const val TARGET_MEDIAN = 0.50f
+    private const val MIN_GAMMA = 0.55f
+    private const val BASE_GRID = 4          // local-luma base is w/4 x h/4
+    private const val DENOISE_MAX_PIXELS = 3_000_000
+
     /** @param portrait true → slightly gentler sharpening (subject already pops). */
     fun enhance(src: Bitmap, portrait: Boolean): Bitmap {
         val w = src.width
@@ -40,11 +50,26 @@ object PhotoEnhancer {
         val pixels = IntArray(w * h)
         src.getPixels(pixels, 0, w, 0, 0, w, h)
 
+        // 0) Dark / noisy captures: measure, denoise, then lift exposure.
+        val median = lumaMedian(pixels)
+        val gamma = if (median < TARGET_MEDIAN) {
+            (ln(TARGET_MEDIAN) / ln(max(median, 0.05f))).coerceIn(MIN_GAMMA, 1f)
+        } else 1f
+        val lift = 1f - gamma
+        val noise = noiseLevel(pixels, w, h)
+        val noiseN = ((noise - 0.4f) / 1.6f).coerceIn(0f, 1f)
+        val mix = (0.15f + 0.55f * noiseN + 0.8f * lift).coerceIn(0f, 0.92f)
+        Log.d(TAG, "median=$median gamma=$gamma noise=$noise mix=$mix")
+        if (mix > 0.2f) {
+            runCatching { denoiseGuided(pixels, w, h, mix, lift, noiseN) }
+        }
+        applyExposure(pixels, gamma)
+
         val (gr, gg, gb) = whiteBalanceGains(pixels)
-        val baseHalf = localLumaBase(src, w, h)
+        val lumaBase = localLumaBase(pixels, w, h)
         val lut = buildToneLut()
 
-        toneAndColorPass(pixels, w, h, lut, baseHalf, gr, gg, gb)
+        toneAndColorPass(pixels, w, h, lut, lumaBase, gr, gg, gb)
         sharpenPass(pixels, w, h, if (portrait) SHARPEN_PORTRAIT else SHARPEN_PHOTO)
 
         return Bitmap.createBitmap(pixels, w, h, Bitmap.Config.ARGB_8888)
@@ -73,21 +98,23 @@ object PhotoEnhancer {
         w: Int,
         h: Int,
         lut: IntArray,
-        baseHalf: FloatArray?,
+        lumaBase: LumaBase?,
         gr: Float,
         gg: Float,
         gb: Float
     ) {
-        val halfW = max(1, w / 2)
-        val halfH = max(1, h / 2)
+        val baseW = lumaBase?.w ?: 1
+        val baseH = lumaBase?.h ?: 1
+        val baseData = lumaBase?.data
+        val bs = BASE_GRID.toFloat()
 
         for (y in 0 until h) {
             val row = y * w
-            // Bilinear y setup for the local-luma base (half resolution).
-            val fy = (y + 0.5f) / 2f - 0.5f
-            val by0 = fy.toInt()
-            val y0 = if (baseHalf != null) by0.coerceIn(0, halfH - 1) else 0
-            val y1 = if (baseHalf != null) (by0 + 1).coerceIn(0, halfH - 1) else 0
+            // Bilinear y setup for the local-luma base (coarse grid).
+            val fy = (y + 0.5f) / bs - 0.5f
+            val by0 = Math.floor(fy.toDouble()).toInt()
+            val y0 = by0.coerceIn(0, baseH - 1)
+            val y1 = (by0 + 1).coerceIn(0, baseH - 1)
             val ty = (fy - by0).coerceIn(0f, 1f)
 
             for (x in 0 until w) {
@@ -106,17 +133,17 @@ object PhotoEnhancer {
                 val yNorm = (lumaW / 255f).coerceIn(0f, 1f)
 
                 // Local tone mapping against the blurred luma base.
-                val outY: Int = if (baseHalf != null) {
-                    val fx = (x + 0.5f) / 2f - 0.5f
-                    val bx0 = fx.toInt()
-                    val x0 = bx0.coerceIn(0, halfW - 1)
-                    val x1 = (bx0 + 1).coerceIn(0, halfW - 1)
+                val outY: Int = if (baseData != null) {
+                    val fx = (x + 0.5f) / bs - 0.5f
+                    val bx0 = Math.floor(fx.toDouble()).toInt()
+                    val x0 = bx0.coerceIn(0, baseW - 1)
+                    val x1 = (bx0 + 1).coerceIn(0, baseW - 1)
                     val tx = (fx - bx0).coerceIn(0f, 1f)
 
-                    val r0 = y0 * halfW
-                    val r1 = y1 * halfW
-                    val top = baseHalf[r0 + x0] + tx * (baseHalf[r0 + x1] - baseHalf[r0 + x0])
-                    val bot = baseHalf[r1 + x0] + tx * (baseHalf[r1 + x1] - baseHalf[r1 + x0])
+                    val r0 = y0 * baseW
+                    val r1 = y1 * baseW
+                    val top = baseData[r0 + x0] + tx * (baseData[r0 + x1] - baseData[r0 + x0])
+                    val bot = baseData[r1 + x0] + tx * (baseData[r1 + x1] - baseData[r1 + x0])
                     val base = top + ty * (bot - top)
 
                     val adj = (yNorm + LOCAL_GAIN * (yNorm - base)).coerceIn(0f, 1f)
@@ -232,19 +259,183 @@ object PhotoEnhancer {
 
     // ------------------------------------------------------------ local base
 
-    /** Blurred luminance at half resolution (guide for local tone mapping). */
-    private fun localLumaBase(src: Bitmap, w: Int, h: Int): FloatArray? {
+    private class LumaBase(val data: FloatArray, val w: Int, val h: Int)
+
+    /** Blurred luminance on a coarse grid (guide for local tone mapping). */
+    private fun localLumaBase(px: IntArray, w: Int, h: Int): LumaBase? {
         return try {
-            val smallW = max(1, w / 8)
-            val smallH = max(1, h / 8)
-            val small = Bitmap.createScaledBitmap(src, smallW, smallH, true)
-            val blurred = fastBlur(small, 2f, 16)
-            val halfW = max(1, w / 2)
-            val halfH = max(1, h / 2)
-            val half = Bitmap.createScaledBitmap(blurred, halfW, halfH, true)
-            bitmapToGrayFloat(half)
+            val gw = max(1, w / BASE_GRID)
+            val gh = max(1, h / BASE_GRID)
+            val g = FloatArray(gw * gh)
+            for (gy in 0 until gh) {
+                for (gx in 0 until gw) {
+                    var acc = 0f
+                    // 2x2 taps inside the block keeps this cheap on 12 MP frames.
+                    for (t in 0 until 4) {
+                        val x = min(w - 1, gx * BASE_GRID + (t and 1) * (BASE_GRID / 2) + BASE_GRID / 4)
+                        val y = min(h - 1, gy * BASE_GRID + (t shr 1) * (BASE_GRID / 2) + BASE_GRID / 4)
+                        val p = px[y * w + x]
+                        acc += 0.299f * ((p shr 16) and 0xFF) + 0.587f * ((p shr 8) and 0xFF) + 0.114f * (p and 0xFF)
+                    }
+                    g[gy * gw + gx] = acc / 4f / 255f
+                }
+            }
+            var blurred = MaskRefiner.boxFilter(g, gw, gh, max(2, min(gw, gh) / 40))
+            blurred = MaskRefiner.boxFilter(blurred, gw, gh, max(2, min(gw, gh) / 40))
+            LumaBase(blurred, gw, gh)
         } catch (t: Throwable) {
             null
+        }
+    }
+
+    // ------------------------------------------------- exposure / denoise
+
+    private fun lumaMedian(px: IntArray): Float {
+        val stride = max(1, px.size / 40_000)
+        val hist = IntArray(256)
+        var n = 0
+        var i = 0
+        while (i < px.size) {
+            val p = px[i]
+            hist[(77 * ((p shr 16) and 0xFF) + 150 * ((p shr 8) and 0xFF) + 29 * (p and 0xFF)) shr 8]++
+            n++
+            i += stride
+        }
+        var acc = 0
+        for (v in 0 until 256) {
+            acc += hist[v]
+            if (acc * 2 >= n) return v / 255f
+        }
+        return 0.5f
+    }
+
+    /**
+     * Robust noise estimate in 0..255 luma units: median |Y - mean(4 neighbours)|.
+     * Clean shots land around 0.3-0.5, grainy low-light shots 1.2+.
+     */
+    private fun noiseLevel(px: IntArray, w: Int, h: Int): Float {
+        if (w < 5 || h < 5) return 0f
+        val hist = IntArray(256)
+        var n = 0
+        val step = max(1, sqrt(px.size / 60_000f).toInt())
+        var y = 1
+        while (y < h - 1) {
+            var x = 1
+            while (x < w - 1) {
+                val i = y * w + x
+                fun l(j: Int): Int {
+                    val p = px[j]
+                    return (77 * ((p shr 16) and 0xFF) + 150 * ((p shr 8) and 0xFF) + 29 * (p and 0xFF)) shr 8
+                }
+                val avg = (l(i - 1) + l(i + 1) + l(i - w) + l(i + w)) / 4f
+                hist[min(255, abs(l(i) - avg).toInt())]++
+                n++
+                x += step
+            }
+            y += step
+        }
+        if (n == 0) return 0f
+        var acc = 0
+        for (v in 0 until 256) {
+            acc += hist[v]
+            if (acc * 2 >= n) return v + 0.35f
+        }
+        return 0f
+    }
+
+    /** Highlight-protected gamma lift; chroma ratio is preserved. */
+    private fun applyExposure(px: IntArray, gamma: Float) {
+        if (gamma >= 0.995f) return
+        val ratio = FloatArray(256)
+        for (i in 0 until 256) {
+            val y = max(i, 1) / 255f
+            val yn = y.pow(gamma)
+            val wgt = ((0.9f - y) / 0.5f).coerceIn(0f, 1f)
+            ratio[i] = (y + (yn - y) * wgt) / y
+        }
+        for (i in px.indices) {
+            val p = px[i]
+            val r = (p shr 16) and 0xFF
+            val g = (p shr 8) and 0xFF
+            val b = p and 0xFF
+            val k = ratio[(77 * r + 150 * g + 29 * b) shr 8]
+            px[i] = (0xFF shl 24) or
+                ((r * k + 0.5f).toInt().coerceIn(0, 255) shl 16) or
+                ((g * k + 0.5f).toInt().coerceIn(0, 255) shl 8) or
+                (b * k + 0.5f).toInt().coerceIn(0, 255)
+        }
+    }
+
+    /**
+     * Edge-aware denoise: per-channel guided filter (luma guide) on a <=3 MP
+     * proxy, chroma smoothed harder than luma, then blended back into the
+     * full-resolution frame by [mix].
+     */
+    private fun denoiseGuided(px: IntArray, w: Int, h: Int, mix: Float, lift: Float, noiseN: Float) {
+        val scale = if (w.toLong() * h > DENOISE_MAX_PIXELS) {
+            sqrt(DENOISE_MAX_PIXELS.toFloat() / (w.toFloat() * h))
+        } else 1f
+        val sw = max(8, (w * scale).toInt())
+        val sh = max(8, (h * scale).toInt())
+
+        val full = Bitmap.createBitmap(px, w, h, Bitmap.Config.ARGB_8888)
+        val small = if (sw == w && sh == h) full else Bitmap.createScaledBitmap(full, sw, sh, true)
+        val sp = IntArray(sw * sh)
+        small.getPixels(sp, 0, sw, 0, 0, sw, sh)
+        small.recycle()
+        if (full !== small) full.recycle()
+
+        val n = sw * sh
+        val r = FloatArray(n); val g = FloatArray(n); val b = FloatArray(n); val y = FloatArray(n)
+        for (i in 0 until n) {
+            val p = sp[i]
+            r[i] = ((p shr 16) and 0xFF) / 255f
+            g[i] = ((p shr 8) and 0xFF) / 255f
+            b[i] = (p and 0xFF) / 255f
+            y[i] = 0.299f * r[i] + 0.587f * g[i] + 0.114f * b[i]
+        }
+        val rad = max(2, min(sw, sh) / 160)
+        val e = 0.004f + 0.03f * lift + 0.02f * noiseN
+        val eps = e * e
+        val dr = MaskRefiner.guidedFilter(y, r, sw, sh, rad, eps)
+        val dg = MaskRefiner.guidedFilter(y, g, sw, sh, rad, eps)
+        val db = MaskRefiner.guidedFilter(y, b, sw, sh, rad, eps)
+
+        // Chroma: stronger edge-aware smoothing of (channel - luma).
+        val yd = FloatArray(n) { 0.299f * dr[it] + 0.587f * dg[it] + 0.114f * db[it] }
+        val cr = FloatArray(n) { dr[it] - yd[it] }
+        val cg = FloatArray(n) { dg[it] - yd[it] }
+        val cb = FloatArray(n) { db[it] - yd[it] }
+        val ceps = 0.02f * 0.02f
+        val crf = MaskRefiner.guidedFilter(yd, cr, sw, sh, rad * 3, ceps)
+        val cgf = MaskRefiner.guidedFilter(yd, cg, sw, sh, rad * 3, ceps)
+        val cbf = MaskRefiner.guidedFilter(yd, cb, sw, sh, rad * 3, ceps)
+
+        val out = IntArray(n)
+        for (i in 0 until n) {
+            val ro = ((yd[i] + crf[i]).coerceIn(0f, 1f) * 255f + 0.5f).toInt()
+            val go = ((yd[i] + cgf[i]).coerceIn(0f, 1f) * 255f + 0.5f).toInt()
+            val bo = ((yd[i] + cbf[i]).coerceIn(0f, 1f) * 255f + 0.5f).toInt()
+            out[i] = (0xFF shl 24) or (ro shl 16) or (go shl 8) or bo
+        }
+        var den = Bitmap.createBitmap(out, sw, sh, Bitmap.Config.ARGB_8888)
+        if (sw != w || sh != h) {
+            val up = Bitmap.createScaledBitmap(den, w, h, true)
+            den.recycle()
+            den = up
+        }
+        val dp = IntArray(w * h)
+        den.getPixels(dp, 0, w, 0, 0, w, h)
+        den.recycle()
+
+        val keep = 1f - mix
+        for (i in px.indices) {
+            val a = px[i]
+            val c = dp[i]
+            val ro = (((a shr 16) and 0xFF) * keep + ((c shr 16) and 0xFF) * mix + 0.5f).toInt()
+            val go = (((a shr 8) and 0xFF) * keep + ((c shr 8) and 0xFF) * mix + 0.5f).toInt()
+            val bo = ((a and 0xFF) * keep + (c and 0xFF) * mix + 0.5f).toInt()
+            px[i] = (0xFF shl 24) or (ro.coerceIn(0, 255) shl 16) or (go.coerceIn(0, 255) shl 8) or bo.coerceIn(0, 255)
         }
     }
 }

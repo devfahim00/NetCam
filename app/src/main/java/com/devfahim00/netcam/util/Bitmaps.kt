@@ -171,7 +171,20 @@ fun scaleLongestSideTo(src: Bitmap, maxSide: Int): Bitmap {
     return Bitmap.createScaledBitmap(src, w, h, true)
 }
 
-/** Small center-cropped square thumbnail for the gallery button. */
+/**
+ * Whole-image thumbnail: scaled down (aspect preserved, nothing cropped) so
+ * the longest side is [size]. Used by the gallery button so the entire photo
+ * is visible in miniature instead of a zoomed-in piece of it.
+ */
+fun Bitmap.fitThumbnail(size: Int): Bitmap {
+    val scale = size.toFloat() / maxOf(width, height)
+    if (scale >= 1f) return this.copy(Bitmap.Config.ARGB_8888, false)
+    val w = (width * scale).roundToInt().coerceAtLeast(1)
+    val h = (height * scale).roundToInt().coerceAtLeast(1)
+    return Bitmap.createScaledBitmap(this, w, h, true)
+}
+
+/** Small center-cropped square thumbnail (legacy). */
 fun Bitmap.centerThumbnail(size: Int): Bitmap {
     val scale = size.toFloat() / minOf(width, height)
     val w = (width * scale).roundToInt().coerceAtLeast(1)

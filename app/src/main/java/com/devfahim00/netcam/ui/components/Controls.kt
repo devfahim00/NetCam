@@ -93,19 +93,25 @@ fun ZoomChip(
     }
 }
 
-/** Gallery shortcut: shows the last captured photo as a circular thumbnail. */
+/**
+ * Gallery shortcut: shows the WHOLE last photo (fit, not cropped) as a small
+ * rounded thumbnail. [busy] draws a thin progress ring while photos are still
+ * being processed in the background.
+ */
 @Composable
 fun GalleryButton(
     thumbnail: ImageBitmap?,
     modifier: Modifier = Modifier,
+    busy: Boolean = false,
     onClick: () -> Unit
 ) {
     val interactionSource = remember { MutableInteractionSource() }
+    val shape = RoundedCornerShape(14.dp)
     Box(
         modifier = modifier
             .size(52.dp)
-            .clip(CircleShape)
-            .glassBackground(shape = CircleShape)
+            .clip(shape)
+            .glassBackground(shape = shape)
             .clickable(
                 interactionSource = interactionSource,
                 indication = null,
@@ -119,13 +125,14 @@ fun GalleryButton(
                 contentDescription = stringResource(R.string.cd_gallery),
                 modifier = Modifier
                     .fillMaxSize()
-                    .clip(CircleShape),
-                contentScale = ContentScale.Crop
+                    .padding(2.dp)
+                    .clip(RoundedCornerShape(12.dp)),
+                contentScale = ContentScale.Fit
             )
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .border(1.dp, Color.White.copy(alpha = 0.35f), CircleShape)
+                    .border(1.dp, Color.White.copy(alpha = 0.35f), shape)
             )
         } else {
             Icon(
@@ -133,6 +140,13 @@ fun GalleryButton(
                 contentDescription = stringResource(R.string.cd_gallery),
                 tint = Color.White.copy(alpha = 0.92f),
                 modifier = Modifier.size(20.dp)
+            )
+        }
+        if (busy) {
+            androidx.compose.material3.CircularProgressIndicator(
+                color = Accent,
+                strokeWidth = 2.dp,
+                modifier = Modifier.size(22.dp)
             )
         }
     }
