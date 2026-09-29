@@ -50,6 +50,11 @@ android {
         kotlinCompilerExtensionVersion = "1.5.14"
     }
 
+    // The depth model must stay uncompressed so it can be memory-mapped.
+    androidResources {
+        noCompress += "tflite"
+    }
+
     packaging {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
@@ -84,5 +89,32 @@ dependencies {
     // ML Kit Selfie Segmentation (bundled, offline person mask — reliable fallback)
     implementation("com.google.mlkit:segmentation-selfie:16.0.0-beta6")
 
+    // TensorFlow Lite — runs the MiDaS depth model that drives portrait blur.
+    implementation("org.tensorflow:tensorflow-lite:2.14.0")
+
     debugImplementation("androidx.compose.ui:ui-tooling")
+}
+
+// ---------------------------------------------------------------------------
+// MiDaS depth model (~66 MB) is downloaded once at build time instead of being
+// committed to git. Works the same locally and in GitHub Actions.
+// ---------------------------------------------------------------------------
+val depthModelFile = layout.projectDirectory.file("src/main/assets/midas.tflite").asFile
+
+val downloadDepthModel by tasks.registering {
+    outputs.file(depthModelFile)
+    doLast {
+        if (!depthModelFile.exists() || depthModelFile.length() < 1_000_000L) {
+            depthModelFile.parentFile.mkdirs()
+            val url = java.net.URL("https://github.com/isl-org/MiDaS/releases/download/v2_1/model_opt.tflite")
+            val tmp = java.io.File(depthModelFile.parentFile, "midas.tflite.part")
+            url.openStream().use { input -> tmp.outputStream().use { out -> input.copyTo(out) } }
+            check(tmp.length() > 1_000_000L) { "Depth model download looks incomplete" }
+            tmp.renameTo(depthModelFile)
+        }
+    }
+}
+
+tasks.matching { it.name == "preBuild" }.configureEach {
+    dependsOn(downloadDepthModel)
 }

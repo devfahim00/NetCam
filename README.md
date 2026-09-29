@@ -77,3 +77,19 @@ app/src/main/java/com/devfahim00/netcam/
 - Package: `com.devfahim00.netcam`, minSdk 24, targetSdk 34.
 - The segmentation model requires Google Play services and is downloaded the
   first time Portrait mode is used on a device.
+
+## Depth-based portrait blur (v1.3)
+
+Portrait sharpness is now decided by **scene depth**, not by the segmentation mask:
+
+1. MiDaS (TFLite, on-device) estimates relative depth; a guided filter snaps depth
+   edges onto real image edges (hair, fingers, fan blades).
+2. The focus plane is the depth of the subject's head/shoulder band — everything at
+   that depth stays sharp, even parts the mask missed (hands, a second person, a table).
+3. Blur radius grows smoothly with distance from the focus plane, in front of *and*
+   behind it, rendered in occlusion-aware layers (no halo around the subject).
+4. The mask only protects the subject's fine edges. If the depth model is missing the
+   old mask-distance bokeh is used automatically.
+
+The depth model (`midas.tflite`, ~66 MB) is downloaded by the `downloadDepthModel`
+Gradle task at build time and is git-ignored.

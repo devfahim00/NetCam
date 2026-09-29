@@ -22,13 +22,15 @@ sealed class PortraitResult {
  *  1. detect the subject (multi-engine, see [SegmentationManager]),
  *  2. refine the soft mask with an edge-aware guided filter + feathering
  *     (see [MaskRefiner]) — this is what fixes jagged/haloed edges,
- *  3. composite a depth-graded 3-layer bokeh behind the sharp subject
- *     (see [BokehCompositor]) at capture resolution,
+ *  3. estimate real scene depth (MiDaS, see [DepthEstimator]) and render a
+ *     depth-of-field blur where sharpness depends on distance from the focus
+ *     plane, not on the mask (see [DepthBokeh]); if the depth model is not
+ *     available, fall back to the mask-distance bokeh ([BokehCompositor]),
  *  4. run the punchy "social-ready" color pipeline (see [PhotoEnhancer]).
  */
 object PortraitProcessor {
 
-    private const val WORKING_SIDE = 1280
+    private const val WORKING_SIDE = 1024
 
     /**
      * @param source decoded, upright capture (any size).
@@ -70,14 +72,22 @@ object PortraitProcessor {
             )
 
             onStage(PortraitStage.BOKEH)
-            var output = BokehCompositor.composite(safeBase, workW, workH, alpha, dist, strength)
+            val depth = DepthEstimator.estimate(working)
+            var output: Bitmap? = if (depth != null) {
+                runCatching { DepthBokeh.render(safeBase, working, alpha, depth, strength) }.getOrNull()
+            } else {
+                null
+            }
+            if (output == null) {
+                output = BokehCompositor.composite(safeBase, workW, workH, alpha, dist, strength)
+            }
 
             if (enhance) {
                 onStage(PortraitStage.ENHANCE)
-                output = PhotoEnhancer.enhance(output, portrait = true)
+                output = PhotoEnhancer.enhance(output!!, portrait = true)
             }
 
-            PortraitResult.Success(output)
+            PortraitResult.Success(output!!)
         } catch (t: Throwable) {
             PortraitResult.Failed
         }

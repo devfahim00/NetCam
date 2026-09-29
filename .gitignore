@@ -7,3 +7,5 @@ build/
 /captures
 .externalNativeBuild
 .cxx
+app/src/main/assets/midas.tflite
+app/src/main/assets/midas.tflite.part

@@ -107,7 +107,7 @@ object MaskRefiner {
      * Classic guided filter (He et al.) with a grayscale guide, evaluated with
      * integral-image box filters so cost is independent of the radius.
      */
-    private fun guidedFilter(
+    internal fun guidedFilter(
         guide: FloatArray,
         input: FloatArray,
         w: Int,
@@ -149,7 +149,7 @@ object MaskRefiner {
     }
 
     /** Mean filter via an integral image; windows are clamped at the borders. */
-    private fun boxFilter(src: FloatArray, w: Int, h: Int, r: Int): FloatArray {
+    internal fun boxFilter(src: FloatArray, w: Int, h: Int, r: Int): FloatArray {
         val iw = w + 1
         val integral = DoubleArray(iw * (h + 1))
         for (y in 0 until h) {

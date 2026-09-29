@@ -109,6 +109,7 @@ import com.devfahim00.netcam.processing.NightDenoise
 import com.devfahim00.netcam.processing.PhotoEnhancer
 import com.devfahim00.netcam.processing.PortraitProcessor
 import com.devfahim00.netcam.processing.PortraitResult
+import com.devfahim00.netcam.processing.DepthEstimator
 import com.devfahim00.netcam.processing.SegmentationManager
 import com.devfahim00.netcam.save.ImageSaver
 import com.devfahim00.netcam.settings.AppSettings
@@ -529,6 +530,7 @@ fun CameraScreen() {
             // Warm up segmentation models early (triggers the one-time
             // Play services download for the subject model).
             launch { SegmentationManager.warmup() }
+            launch(Dispatchers.Default) { DepthEstimator.init(context) }
         } catch (e: Exception) {
             toastRes = R.string.camera_error
         }
