@@ -1,3 +1,6 @@
+import java.io.File
+import java.net.URL
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -106,9 +109,11 @@ val downloadDepthModel by tasks.registering {
     doLast {
         if (!depthModelFile.exists() || depthModelFile.length() < 1_000_000L) {
             depthModelFile.parentFile.mkdirs()
-            val url = java.net.URL("https://github.com/isl-org/MiDaS/releases/download/v2_1/model_opt.tflite")
-            val tmp = java.io.File(depthModelFile.parentFile, "midas.tflite.part")
-            url.openStream().use { input -> tmp.outputStream().use { out -> input.copyTo(out) } }
+            val url = URL("https://github.com/isl-org/MiDaS/releases/download/v2_1/model_opt.tflite")
+            val tmp = File(depthModelFile.parentFile, "midas.tflite.part")
+            url.openStream().use { input ->
+                tmp.outputStream().use { out -> input.copyTo(out) }
+            }
             check(tmp.length() > 1_000_000L) { "Depth model download looks incomplete" }
             tmp.renameTo(depthModelFile)
         }
